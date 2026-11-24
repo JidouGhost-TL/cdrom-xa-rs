@@ -10,6 +10,8 @@
 use alloc::collections::BTreeMap;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
+#[cfg(feature = "alloc")]
+use core::fmt;
 
 use crate::error::{Error, Result};
 #[cfg(feature = "alloc")]
@@ -49,6 +51,7 @@ pub struct XaCoding {
 
 impl XaCoding {
     /// Decode a CD-ROM XA subheader coding-info byte.
+    #[must_use]
     pub const fn from_byte(byte: u8) -> Self {
         Self {
             stereo: byte & 0x01 != 0,
@@ -59,6 +62,7 @@ impl XaCoding {
     }
 
     /// Encode this coding descriptor back into a subheader coding-info byte.
+    #[must_use]
     pub const fn to_byte(self) -> u8 {
         let mut b = 0u8;
         if self.stereo {
@@ -77,6 +81,7 @@ impl XaCoding {
     }
 
     /// Number of audio channels (`2` for stereo, `1` for mono).
+    #[must_use]
     pub const fn channels(self) -> u8 {
         if self.stereo {
             2
@@ -118,11 +123,22 @@ pub struct XaState {
 
 impl XaState {
     /// Create a zero-initialized predictor state.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             left: ChannelHistory { prev1: 0, prev2: 0 },
             right: ChannelHistory { prev1: 0, prev2: 0 },
         }
+    }
+}
+
+#[inline]
+const fn decode_4bit_shift(hdr: u8) -> u8 {
+    let shift = hdr & 0x0F;
+    if shift > 12 {
+        9
+    } else {
+        shift
     }
 }
 
@@ -146,27 +162,21 @@ pub fn decode_sound_group_4bit(
         let hdr_lo = header[hdr_off];
         let hdr_hi = header[hdr_off + 1];
 
-        let shift_lo = (hdr_lo & 0x0F).min(12);
-        let filter_lo = ((hdr_lo >> 4) & 0x0F) as usize;
-        let shift_hi = (hdr_hi & 0x0F).min(12);
-        let filter_hi = ((hdr_hi >> 4) & 0x0F) as usize;
+        let shift_lo = decode_4bit_shift(hdr_lo);
+        let filter_lo = ((hdr_lo >> 4) & 0x03) as usize;
+        let shift_hi = decode_4bit_shift(hdr_hi);
+        let filter_hi = ((hdr_hi >> 4) & 0x03) as usize;
 
         if stereo {
-            let mut left_buf = [0i16; SAMPLES_PER_UNIT];
-            let mut right_buf = [0i16; SAMPLES_PER_UNIT];
             for j in 0..SAMPLES_PER_UNIT {
                 let byte = data[4 * j + slot];
                 let nib_lo = i16::from(byte & 0x0F);
                 let delta_lo = i32::from((nib_lo << 12) >> shift_lo);
-                left_buf[j] = state.left.step(delta_lo, filter_lo);
+                out[out_pos] = state.left.step(delta_lo, filter_lo);
 
                 let nib_hi = i16::from((byte >> 4) & 0x0F);
                 let delta_hi = i32::from((nib_hi << 12) >> shift_hi);
-                right_buf[j] = state.right.step(delta_hi, filter_hi);
-            }
-            for j in 0..SAMPLES_PER_UNIT {
-                out[out_pos] = left_buf[j];
-                out[out_pos + 1] = right_buf[j];
+                out[out_pos + 1] = state.right.step(delta_hi, filter_hi);
                 out_pos += 2;
             }
         } else {
@@ -209,24 +219,18 @@ pub fn decode_sound_group_8bit(
             let hdr_l = header[4 + slot_l];
             let hdr_r = header[4 + slot_r];
             let shift_l = (hdr_l & 0x0F).min(8);
-            let filter_l = ((hdr_l >> 4) & 0x0F) as usize;
+            let filter_l = ((hdr_l >> 4) & 0x03) as usize;
             let shift_r = (hdr_r & 0x0F).min(8);
-            let filter_r = ((hdr_r >> 4) & 0x0F) as usize;
+            let filter_r = ((hdr_r >> 4) & 0x03) as usize;
 
-            let mut left_buf = [0i16; SAMPLES_PER_UNIT];
-            let mut right_buf = [0i16; SAMPLES_PER_UNIT];
             for j in 0..SAMPLES_PER_UNIT {
                 let raw_l = i16::from(data[4 * j + slot_l] as i8);
                 let delta_l = i32::from((raw_l << 8) >> shift_l);
-                left_buf[j] = state.left.step(delta_l, filter_l);
+                out[out_pos] = state.left.step(delta_l, filter_l);
 
                 let raw_r = i16::from(data[4 * j + slot_r] as i8);
                 let delta_r = i32::from((raw_r << 8) >> shift_r);
-                right_buf[j] = state.right.step(delta_r, filter_r);
-            }
-            for j in 0..SAMPLES_PER_UNIT {
-                out[out_pos] = left_buf[j];
-                out[out_pos + 1] = right_buf[j];
+                out[out_pos + 1] = state.right.step(delta_r, filter_r);
                 out_pos += 2;
             }
         }
@@ -234,7 +238,7 @@ pub fn decode_sound_group_8bit(
         for slot in 0..UNITS_PER_BLOCK {
             let hdr = header[4 + slot];
             let shift = (hdr & 0x0F).min(8);
-            let filter = ((hdr >> 4) & 0x0F) as usize;
+            let filter = ((hdr >> 4) & 0x03) as usize;
             for j in 0..SAMPLES_PER_UNIT {
                 let raw = i16::from(data[4 * j + slot] as i8);
                 let delta = i32::from((raw << 8) >> shift);
@@ -310,6 +314,7 @@ pub struct XaDecoder {
 #[cfg(feature = "alloc")]
 impl XaDecoder {
     /// Create a new decoder for the given [`XaCoding`].
+    #[must_use]
     pub fn new(coding: XaCoding) -> Self {
         Self {
             coding,
@@ -319,6 +324,7 @@ impl XaDecoder {
     }
 
     /// Return the configured [`XaCoding`].
+    #[must_use]
     pub const fn coding(&self) -> XaCoding {
         self.coding
     }
@@ -362,6 +368,7 @@ impl XaDecoder {
     }
 
     /// Consume the decoder and return all accumulated interleaved `i16` PCM samples.
+    #[must_use]
     pub fn finish(self) -> Vec<i16> {
         self.samples
     }
@@ -408,66 +415,88 @@ pub struct XaStream {
 }
 
 #[cfg(feature = "alloc")]
+impl fmt::Debug for XaStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XaStream")
+            .field("mode", &self.mode)
+            .field("sector_count", &self.sector_count)
+            .field("stream_count", &self.channels.len())
+            .field("data_len", &self.data.len())
+            .finish()
+    }
+}
+
+#[cfg(feature = "alloc")]
+fn index_xa_payload(
+    payload: &[u8],
+    base_offset: usize,
+) -> Result<(SectorMode, usize, BTreeMap<XaStreamKey, IndexedChannel>)> {
+    if payload.is_empty() {
+        return Err(Error::InvalidXa("empty XA stream"));
+    }
+    let mode = if payload.len() % RAW_SECTOR_SIZE == 0
+        && payload[..12] == SYNC_PATTERN
+        && payload[15] == 2
+    {
+        SectorMode::Mode2_2352
+    } else if payload.len() % MODE2_2336_SIZE == 0 {
+        SectorMode::Mode2_2336
+    } else {
+        return Err(Error::InvalidSectorSize(payload.len()));
+    };
+
+    let stride = mode.stride();
+    let sub_off = mode
+        .subheader_offset()
+        .ok_or(Error::InvalidXa("Mode 2 layout requires subheader"))?;
+    let user_off = mode.user_offset();
+    let sector_count = payload.len() / stride;
+    let mut channels: BTreeMap<XaStreamKey, IndexedChannel> = BTreeMap::new();
+
+    for idx in 0..sector_count {
+        let base = idx * stride;
+        let sec = &payload[base..base + stride];
+        if mode == SectorMode::Mode2_2352 && (sec[..12] != SYNC_PATTERN || sec[15] != 2) {
+            return Err(Error::BadSync);
+        }
+        let sub_bytes: &[u8; 8] = sec[sub_off..sub_off + 8]
+            .try_into()
+            .map_err(|_| Error::InvalidXa("short subheader"))?;
+        let sub = Subheader::from_bytes(sub_bytes)?;
+        if !sub.is_form2() || !sub.is_audio() {
+            continue;
+        }
+        let key = XaStreamKey {
+            file: sub.file,
+            channel: sub.channel,
+        };
+        let coding = XaCoding::from_byte(sub.coding);
+        let entry = channels.entry(key).or_insert_with(|| IndexedChannel {
+            coding,
+            sector_offsets: Vec::new(),
+        });
+        entry.sector_offsets.push(base_offset + base + user_off);
+    }
+
+    if channels.is_empty() {
+        return Err(Error::InvalidXa(
+            "no Mode 2 Form 2 audio sectors found in stream",
+        ));
+    }
+
+    Ok((mode, sector_count, channels))
+}
+
+#[cfg(feature = "alloc")]
 impl XaStream {
     /// Parse and index all Mode 2 Form 2 audio streams in `bytes`.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let payload = match unwrap_riff_cdxa(bytes) {
-            Ok(unwrapped) => unwrapped,
-            Err(_) => bytes,
-        };
-        if payload.is_empty() {
-            return Err(Error::InvalidXa("empty XA stream"));
-        }
-        let mode = if payload.len() % RAW_SECTOR_SIZE == 0
-            && payload[..12] == SYNC_PATTERN
-            && payload[15] == 2
-        {
-            SectorMode::Mode2_2352
-        } else if payload.len() % MODE2_2336_SIZE == 0 {
-            SectorMode::Mode2_2336
+        let payload = if bytes.starts_with(b"RIFF") {
+            unwrap_riff_cdxa(bytes)?
         } else {
-            return Err(Error::InvalidSectorSize(payload.len()));
+            bytes
         };
-
-        let stride = mode.stride();
-        let sub_off = mode
-            .subheader_offset()
-            .ok_or(Error::InvalidXa("Mode 2 layout requires subheader"))?;
-        let user_off = mode.user_offset();
-        let sector_count = payload.len() / stride;
-        let mut channels: BTreeMap<XaStreamKey, IndexedChannel> = BTreeMap::new();
-
-        for idx in 0..sector_count {
-            let base = idx * stride;
-            let sec = &payload[base..base + stride];
-            if mode == SectorMode::Mode2_2352 && (sec[..12] != SYNC_PATTERN || sec[15] != 2) {
-                return Err(Error::BadSync);
-            }
-            let sub_bytes: &[u8; 8] = sec[sub_off..sub_off + 8]
-                .try_into()
-                .map_err(|_| Error::InvalidXa("short subheader"))?;
-            let sub = Subheader::from_bytes(sub_bytes)?;
-            if !sub.is_form2() || !sub.is_audio() {
-                continue;
-            }
-            let key = XaStreamKey {
-                file: sub.file,
-                channel: sub.channel,
-            };
-            let coding = XaCoding::from_byte(sub.coding);
-            let entry = channels.entry(key).or_insert_with(|| IndexedChannel {
-                coding,
-                sector_offsets: Vec::new(),
-            });
-            entry.sector_offsets.push(base + user_off);
-        }
-
-        if channels.is_empty() {
-            return Err(Error::InvalidXa(
-                "no Mode 2 Form 2 audio sectors found in stream",
-            ));
-        }
-
+        let (mode, sector_count, channels) = index_xa_payload(payload, 0)?;
         Ok(Self {
             data: payload.to_vec(),
             mode,
@@ -476,17 +505,41 @@ impl XaStream {
         })
     }
 
+    /// Parse and index all Mode 2 Form 2 audio streams from an owned `Vec<u8>`
+    /// without cloning the underlying buffer.
+    pub fn from_vec(data: Vec<u8>) -> Result<Self> {
+        let (payload_start, payload_len) = if data.starts_with(b"RIFF") {
+            let payload = unwrap_riff_cdxa(&data)?;
+            (RIFF_CDXA_HEADER_SIZE, payload.len())
+        } else {
+            (0, data.len())
+        };
+        let (mode, sector_count, channels) = index_xa_payload(
+            &data[payload_start..payload_start + payload_len],
+            payload_start,
+        )?;
+        Ok(Self {
+            data,
+            mode,
+            sector_count,
+            channels,
+        })
+    }
+
     /// Physical sector framing of the parsed stream (`Mode2_2352` or `Mode2_2336`).
+    #[must_use]
     pub const fn mode(&self) -> SectorMode {
         self.mode
     }
 
     /// Total number of sectors in the underlying stream buffer.
+    #[must_use]
     pub const fn sector_count(&self) -> usize {
         self.sector_count
     }
 
     /// List all indexed `(file, channel)` audio streams.
+    #[must_use]
     pub fn streams(&self) -> Vec<XaStreamInfo> {
         self.channels
             .iter()
@@ -520,6 +573,7 @@ impl XaStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "alloc")]
     use crate::sector::{SUBMODE_AUDIO, SUBMODE_FORM2, SUBMODE_REALTIME};
 
     #[test]
@@ -567,6 +621,130 @@ mod tests {
         decode_sound_group_8bit(&group, true, &mut state, &mut out);
         assert_eq!(out[0], 4096);
         assert_eq!(out[1], -4096);
+
+        // 8-bit mono: slot 0 has 28 samples at out[0..28], slot 1 at out[28..56]
+        let mut mono_state = XaState::new();
+        let mut mono_out = [0i16; 112];
+        decode_sound_group_8bit(&group, false, &mut mono_state, &mut mono_out);
+        assert_eq!(mono_out[0], 4096);
+        assert_eq!(mono_out[28], -4096);
+    }
+
+    #[test]
+    fn decode_4bit_shift_above_12_maps_to_9_and_masks_reserved_filter_bits() {
+        let mut group_shift9 = [0u8; SOUND_GROUP_SIZE];
+        group_shift9[4] = 0x09; // filter 0, shift 9
+        group_shift9[16] = 0x04; // low nibble = +4 -> (4 << 12) >> 9 = 32
+
+        let mut out_shift9 = [0i16; 224];
+        decode_sound_group_4bit(&group_shift9, false, &mut XaState::new(), &mut out_shift9);
+        assert_eq!(out_shift9[0], 32);
+
+        for bad_shift in [13u8, 14, 15] {
+            let mut group = group_shift9;
+            group[4] = bad_shift; // filter 0, shift > 12 -> must map to 9 (NOT 12)
+            let mut out = [0i16; 224];
+            decode_sound_group_4bit(&group, false, &mut XaState::new(), &mut out);
+            assert_eq!(out[0], out_shift9[0]);
+            assert_ne!(out[0], 4); // shift 12 would have yielded 4
+        }
+
+        // Reserved bits 6..7 set (0xC0 -> filter 0, 0xD0 -> filter 1, not forced to filter 3)
+        let mut group_res = [0u8; SOUND_GROUP_SIZE];
+        group_res[4] = 0xD0; // reserved bits 0xC0 + filter 1 (0x10), shift 0
+        group_res[16] = 0x01; // +1 << 12 = 4096
+        let mut out_res = [0i16; 224];
+        decode_sound_group_4bit(&group_res, false, &mut XaState::new(), &mut out_res);
+        assert_eq!(out_res[0], 4096);
+        // Filter 1 (K0=60, K1=0): (4096 * 60 + 32) >> 6 = 3840
+        assert_eq!(out_res[1], 3840);
+
+        // Same reserved-bit masking in 8-bit mode
+        let mut group_8 = [0u8; SOUND_GROUP_SIZE];
+        group_8[4] = 0xC0; // reserved bits 0xC0 + filter 0, shift 0
+        group_8[16] = 0x10; // +16 << 8 = 4096
+        let mut out_8 = [0i16; 112];
+        decode_sound_group_8bit(&group_8, false, &mut XaState::new(), &mut out_8);
+        assert_eq!(out_8[0], 4096);
+        assert_eq!(out_8[1], 0); // filter 0 has K0=0, K1=0
+    }
+
+    #[test]
+    fn decode_4bit_filters_2_and_3_and_i16_saturation() {
+        // Filter 2: K0 = 115, K1 = -52
+        let mut g2 = [0u8; SOUND_GROUP_SIZE];
+        g2[4] = 0x20; // filter 2, shift 0
+        g2[16] = 0x01; // sample 0 delta = 4096, subsequent deltas = 0
+        let mut out2 = [0i16; 224];
+        decode_sound_group_4bit(&g2, false, &mut XaState::new(), &mut out2);
+        // s0 = 4096
+        // s1 = (4096 * 115 + 0 * -52 + 32) >> 6 = 7360
+        // s2 = (7360 * 115 + 4096 * -52 + 32) >> 6 = 9897
+        assert_eq!(out2[0], 4096);
+        assert_eq!(out2[1], 7360);
+        assert_eq!(out2[2], 9897);
+
+        // Filter 3: K0 = 98, K1 = -55
+        let mut g3 = [0u8; SOUND_GROUP_SIZE];
+        g3[4] = 0x30; // filter 3, shift 0
+        g3[16] = 0x01;
+        let mut out3 = [0i16; 224];
+        decode_sound_group_4bit(&g3, false, &mut XaState::new(), &mut out3);
+        // s0 = 4096
+        // s1 = (4096 * 98 + 32) >> 6 = 6272
+        // s2 = (6272 * 98 + 4096 * -55 + 32) >> 6 = 6084
+        assert_eq!(out3[0], 4096);
+        assert_eq!(out3[1], 6272);
+        assert_eq!(out3[2], 6084);
+
+        // Positive and negative saturation
+        let mut g_pos = [0u8; SOUND_GROUP_SIZE];
+        g_pos[4] = 0x10; // filter 1, shift 0
+        for row in 0..8 {
+            g_pos[16 + 4 * row] = 0x07; // +7 << 12 = +28672 repeatedly
+        }
+        let mut out_pos = [0i16; 224];
+        decode_sound_group_4bit(&g_pos, false, &mut XaState::new(), &mut out_pos);
+        assert_eq!(out_pos[1], i16::MAX);
+
+        let mut g_neg = [0u8; SOUND_GROUP_SIZE];
+        g_neg[4] = 0x10;
+        for row in 0..8 {
+            g_neg[16 + 4 * row] = 0x08; // -8 << 12 = -32768 repeatedly
+        }
+        let mut out_neg = [0i16; 224];
+        decode_sound_group_4bit(&g_neg, false, &mut XaState::new(), &mut out_neg);
+        assert_eq!(out_neg[1], i16::MIN);
+    }
+
+    #[test]
+    fn malformed_riff_cdxa_returns_invalid_riff_cdxa() {
+        assert!(matches!(
+            unwrap_riff_cdxa(b"RIFF\x00\x00\x00\x00WAVE"),
+            Err(Error::InvalidRiffCdxa(_))
+        ));
+
+        let mut bad_form = [0u8; RIFF_CDXA_HEADER_SIZE + RAW_SECTOR_SIZE];
+        bad_form[0..4].copy_from_slice(b"RIFF");
+        let riff_size = (RIFF_CDXA_HEADER_SIZE - 8 + RAW_SECTOR_SIZE) as u32;
+        bad_form[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        bad_form[8..12].copy_from_slice(b"WAVE");
+        assert!(matches!(
+            unwrap_riff_cdxa(&bad_form),
+            Err(Error::InvalidRiffCdxa(_))
+        ));
+
+        #[cfg(feature = "alloc")]
+        {
+            assert!(matches!(
+                XaStream::parse(&bad_form),
+                Err(Error::InvalidRiffCdxa(_))
+            ));
+            assert!(matches!(
+                XaStream::from_vec(bad_form.to_vec()),
+                Err(Error::InvalidRiffCdxa(_))
+            ));
+        }
     }
 
     #[cfg(feature = "alloc")]
@@ -629,5 +807,12 @@ mod tests {
         assert!(!coding1.stereo);
         assert_eq!(coding1.sample_rate_hz, 18_900);
         assert_eq!(pcm1.len(), 4032);
+
+        // Verify zero-copy XaStream::from_vec matches XaStream::parse on both RIFF and raw inputs
+        let from_vec_riff = XaStream::from_vec(wrapped).unwrap();
+        assert_eq!(from_vec_riff.decode(1, 0).unwrap(), (coding0, pcm0));
+        let from_vec_raw = XaStream::from_vec(sectors).unwrap();
+        assert_eq!(from_vec_raw.decode(1, 1).unwrap(), (coding1, pcm1));
+        assert!(alloc::format!("{from_vec_raw:?}").contains("XaStream"));
     }
 }

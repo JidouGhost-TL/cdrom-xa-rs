@@ -33,3 +33,37 @@ pub mod sector;
 pub mod xa;
 
 pub use error::{Error, Result};
+
+#[cfg(test)]
+mod tests {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn public_types_are_send_and_sync() {
+        assert_send_sync::<crate::Error>();
+        assert_send_sync::<crate::sector::SectorMode>();
+        assert_send_sync::<crate::sector::Subheader>();
+        assert_send_sync::<crate::sector::Msf>();
+        assert_send_sync::<crate::xa::XaCoding>();
+        assert_send_sync::<crate::xa::XaState>();
+
+        #[cfg(feature = "alloc")]
+        {
+            assert_send_sync::<crate::cue::CueSheet>();
+            assert_send_sync::<crate::cue::CueFile>();
+            assert_send_sync::<crate::cue::CueTrack>();
+            assert_send_sync::<crate::cue::CueIndex>();
+            assert_send_sync::<crate::cue::TrackMode>();
+            assert_send_sync::<crate::iso::IsoImage>();
+            assert_send_sync::<crate::iso::IsoRecord>();
+            assert_send_sync::<crate::iso::PrimaryVolumeDescriptor>();
+            assert_send_sync::<crate::iso::XaAttributes>();
+            assert_send_sync::<crate::repack::IsoRepacker>();
+            assert_send_sync::<crate::repack::RepackReport>();
+            assert_send_sync::<crate::xa::XaDecoder>();
+            assert_send_sync::<crate::xa::XaStream>();
+            assert_send_sync::<crate::xa::XaStreamInfo>();
+            assert_send_sync::<crate::xa::XaStreamKey>();
+        }
+    }
+}

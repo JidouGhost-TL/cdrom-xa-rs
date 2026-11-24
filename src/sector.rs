@@ -122,6 +122,7 @@ pub enum SectorMode {
 
 impl SectorMode {
     /// Byte stride of one stored sector in this layout.
+    #[must_use]
     pub const fn stride(self) -> usize {
         match self {
             SectorMode::Mode1_2352 | SectorMode::Mode2_2352 => RAW_SECTOR_SIZE,
@@ -131,6 +132,7 @@ impl SectorMode {
     }
 
     /// Byte offset of the user-data field within a stored sector.
+    #[must_use]
     pub const fn user_offset(self) -> usize {
         match self {
             SectorMode::Cooked2048 => 0,
@@ -141,6 +143,7 @@ impl SectorMode {
     }
 
     /// Byte offset of the 8-byte CD-ROM XA subheader, if present in this layout.
+    #[must_use]
     pub const fn subheader_offset(self) -> Option<usize> {
         match self {
             SectorMode::Cooked2048 | SectorMode::Mode1_2352 => None,
@@ -165,6 +168,7 @@ pub struct Subheader {
 
 impl Subheader {
     /// Construct a new subheader from its four fields.
+    #[must_use]
     pub const fn new(file: u8, channel: u8, submode: u8, coding: u8) -> Self {
         Self {
             file,
@@ -183,6 +187,7 @@ impl Subheader {
     }
 
     /// Parse an 8-byte subheader from its first 4 bytes without checking the duplicate copy.
+    #[must_use]
     pub const fn from_bytes_unchecked(bytes: &[u8; SUBHEADER_SIZE]) -> Self {
         Self {
             file: bytes[0],
@@ -193,6 +198,7 @@ impl Subheader {
     }
 
     /// Encode this subheader into its duplicated 8-byte on-disc representation.
+    #[must_use]
     pub const fn to_bytes(self) -> [u8; SUBHEADER_SIZE] {
         [
             self.file,
@@ -207,41 +213,49 @@ impl Subheader {
     }
 
     /// Returns `true` if the Form 2 bit (`0x20`) is set (2324-byte user payload).
+    #[must_use]
     pub const fn is_form2(self) -> bool {
         self.submode & SUBMODE_FORM2 != 0
     }
 
     /// Returns `true` if the Audio bit (`0x04`) is set.
+    #[must_use]
     pub const fn is_audio(self) -> bool {
         self.submode & SUBMODE_AUDIO != 0
     }
 
     /// Returns `true` if the Video bit (`0x02`) is set.
+    #[must_use]
     pub const fn is_video(self) -> bool {
         self.submode & SUBMODE_VIDEO != 0
     }
 
     /// Returns `true` if the Data bit (`0x08`) is set.
+    #[must_use]
     pub const fn is_data(self) -> bool {
         self.submode & SUBMODE_DATA != 0
     }
 
     /// Returns `true` if the End of Record bit (`0x01`) is set.
+    #[must_use]
     pub const fn is_eor(self) -> bool {
         self.submode & SUBMODE_EOR != 0
     }
 
     /// Returns `true` if the End of File bit (`0x80`) is set.
+    #[must_use]
     pub const fn is_eof(self) -> bool {
         self.submode & SUBMODE_EOF != 0
     }
 
     /// Returns `true` if the Trigger bit (`0x10`) is set.
+    #[must_use]
     pub const fn is_trigger(self) -> bool {
         self.submode & SUBMODE_TRIGGER != 0
     }
 
     /// Returns `true` if the Real-time bit (`0x40`) is set.
+    #[must_use]
     pub const fn is_realtime(self) -> bool {
         self.submode & SUBMODE_REALTIME != 0
     }
@@ -260,12 +274,14 @@ pub struct Msf {
 
 impl Msf {
     /// Create a new MSF address.
+    #[must_use]
     pub const fn new(min: u8, sec: u8, frame: u8) -> Self {
         Self { min, sec, frame }
     }
 
     /// Convert this MSF address to a Logical Block Address (LBA), subtracting
     /// the standard 150-sector (2-second) lead-in pregap.
+    #[must_use]
     pub const fn to_lba(self) -> i32 {
         msf_to_lba(self)
     }
@@ -287,7 +303,13 @@ impl Msf {
     }
 
     /// Encode this MSF address as 3 packed-BCD bytes.
+    ///
+    /// Rejects out-of-range components (`min > 99`, `sec >= 60`, or `frame >= 75`)
+    /// with [`Error::Overflow`], symmetric with [`Msf::from_bcd`].
     pub fn to_bcd(self) -> Result<[u8; 3]> {
+        if self.min > 99 || self.sec >= 60 || self.frame >= 75 {
+            return Err(Error::Overflow);
+        }
         Ok([
             u8_to_bcd(self.min)?,
             u8_to_bcd(self.sec)?,
@@ -296,6 +318,7 @@ impl Msf {
     }
 
     /// Convert this MSF value into a raw frame count without subtracting the 150-frame pregap.
+    #[must_use]
     pub const fn to_frames(self) -> u32 {
         ((self.min as u32) * 60 + (self.sec as u32)) * 75 + (self.frame as u32)
     }
@@ -303,6 +326,7 @@ impl Msf {
 
 /// Convert an [`Msf`] address to a Logical Block Address (LBA), subtracting the
 /// standard 150-sector (2-second) pregap.
+#[must_use]
 pub const fn msf_to_lba(msf: Msf) -> i32 {
     ((msf.min as i32) * 60 + (msf.sec as i32)) * 75 + (msf.frame as i32) - 150
 }
@@ -346,6 +370,7 @@ pub const fn u8_to_bcd(value: u8) -> Result<u8> {
 }
 
 /// Compute the Yellow Book / CD-ROM XA Error Detection Code (CRC-32, polynomial `0xD8018001`).
+#[must_use]
 pub fn compute_edc(bytes: &[u8]) -> u32 {
     let mut edc = 0u32;
     for &byte in bytes {
@@ -401,27 +426,14 @@ pub fn regenerate_mode2_form1_edc_ecc(raw: &mut [u8; RAW_SECTOR_SIZE]) {
     let saved_header = [raw[0x0C], raw[0x0D], raw[0x0E], raw[0x0F]];
     raw[0x0C..0x10].fill(0);
 
-    let mut p_source = [0u8; MODE2_FORM1_ECC_P_OFFSET - 0x0C];
-    p_source.copy_from_slice(&raw[0x0C..MODE2_FORM1_ECC_P_OFFSET]);
-    compute_ecc_block(
-        &p_source,
-        86,
-        24,
-        2,
-        86,
-        &mut raw[MODE2_FORM1_ECC_P_OFFSET..MODE2_FORM1_ECC_Q_OFFSET],
-    );
-
-    let mut q_source = [0u8; MODE2_FORM1_ECC_Q_OFFSET - 0x0C];
-    q_source.copy_from_slice(&raw[0x0C..MODE2_FORM1_ECC_Q_OFFSET]);
-    compute_ecc_block(
-        &q_source,
-        52,
-        43,
-        86,
-        88,
-        &mut raw[MODE2_FORM1_ECC_Q_OFFSET..RAW_SECTOR_SIZE],
-    );
+    {
+        let (p_src, p_dst) = raw.split_at_mut(MODE2_FORM1_ECC_P_OFFSET);
+        compute_ecc_block(&p_src[0x0C..], 86, 24, 2, 86, &mut p_dst[..ECC_P_LEN]);
+    }
+    {
+        let (q_src, q_dst) = raw.split_at_mut(MODE2_FORM1_ECC_Q_OFFSET);
+        compute_ecc_block(&q_src[0x0C..], 52, 43, 86, 88, &mut q_dst[..ECC_Q_LEN]);
+    }
 
     raw[0x0C..0x10].copy_from_slice(&saved_header);
 }
@@ -472,27 +484,14 @@ pub fn regenerate_mode1_edc_ecc(raw: &mut [u8; RAW_SECTOR_SIZE]) {
     raw[MODE1_EDC_OFFSET..MODE1_EDC_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
     raw[MODE1_EDC_OFFSET + 4..MODE2_FORM1_ECC_P_OFFSET].fill(0);
 
-    let mut p_source = [0u8; MODE2_FORM1_ECC_P_OFFSET - 0x0C];
-    p_source.copy_from_slice(&raw[0x0C..MODE2_FORM1_ECC_P_OFFSET]);
-    compute_ecc_block(
-        &p_source,
-        86,
-        24,
-        2,
-        86,
-        &mut raw[MODE2_FORM1_ECC_P_OFFSET..MODE2_FORM1_ECC_Q_OFFSET],
-    );
-
-    let mut q_source = [0u8; MODE2_FORM1_ECC_Q_OFFSET - 0x0C];
-    q_source.copy_from_slice(&raw[0x0C..MODE2_FORM1_ECC_Q_OFFSET]);
-    compute_ecc_block(
-        &q_source,
-        52,
-        43,
-        86,
-        88,
-        &mut raw[MODE2_FORM1_ECC_Q_OFFSET..RAW_SECTOR_SIZE],
-    );
+    {
+        let (p_src, p_dst) = raw.split_at_mut(MODE2_FORM1_ECC_P_OFFSET);
+        compute_ecc_block(&p_src[0x0C..], 86, 24, 2, 86, &mut p_dst[..ECC_P_LEN]);
+    }
+    {
+        let (q_src, q_dst) = raw.split_at_mut(MODE2_FORM1_ECC_Q_OFFSET);
+        compute_ecc_block(&q_src[0x0C..], 52, 43, 86, 88, &mut q_dst[..ECC_Q_LEN]);
+    }
 }
 
 /// Verify Mode 1 EDC, zeroed intermediate field, and Reed-Solomon P/Q ECC.
@@ -553,6 +552,7 @@ pub fn regenerate_mode2_form2_edc(raw: &mut [u8; RAW_SECTOR_SIZE]) {
 ///
 /// Note that the CD-ROM XA specification allows Form 2 EDC to be zeroed (omitted);
 /// this function strictly checks the computed CRC-32 against the stored 4 bytes.
+/// Use [`verify_mode2_form2_edc_allow_zero`] to accept zeroed Form 2 EDC fields.
 pub fn verify_mode2_form2_edc(raw: &[u8; RAW_SECTOR_SIZE]) -> Result<()> {
     let expected = compute_edc(&raw[0x10..MODE2_FORM2_EDC_OFFSET]);
     let actual = u32::from_le_bytes([
@@ -561,6 +561,25 @@ pub fn verify_mode2_form2_edc(raw: &[u8; RAW_SECTOR_SIZE]) -> Result<()> {
         raw[MODE2_FORM2_EDC_OFFSET + 2],
         raw[MODE2_FORM2_EDC_OFFSET + 3],
     ]);
+    if actual != expected {
+        return Err(Error::BadEdc { expected, actual });
+    }
+    Ok(())
+}
+
+/// Verify Mode 2 Form 2 EDC on a raw 2352-byte sector, accepting an all-zero
+/// EDC field (`0x0000_0000`) as permitted by the CD-ROM XA specification.
+pub fn verify_mode2_form2_edc_allow_zero(raw: &[u8; RAW_SECTOR_SIZE]) -> Result<()> {
+    let actual = u32::from_le_bytes([
+        raw[MODE2_FORM2_EDC_OFFSET],
+        raw[MODE2_FORM2_EDC_OFFSET + 1],
+        raw[MODE2_FORM2_EDC_OFFSET + 2],
+        raw[MODE2_FORM2_EDC_OFFSET + 3],
+    ]);
+    if actual == 0 {
+        return Ok(());
+    }
+    let expected = compute_edc(&raw[0x10..MODE2_FORM2_EDC_OFFSET]);
     if actual != expected {
         return Err(Error::BadEdc { expected, actual });
     }
@@ -609,6 +628,7 @@ pub fn build_mode2_form1_sector(
 /// Build a stripped 2336-byte Mode 2 Form 1 sector with freshly computed EDC/ECC.
 ///
 /// The Form 2 bit in `subheader.submode` is cleared automatically.
+#[must_use]
 pub fn build_mode2_2336_sector(
     user_data: &[u8; COOKED_SECTOR_SIZE],
     mut subheader: Subheader,
@@ -669,6 +689,7 @@ pub fn extract_user_data(sector: &[u8], mode: SectorMode) -> Result<&[u8]> {
 /// Auto-detect the [`SectorMode`] of a disc image slice by inspecting the
 /// ISO-9660 Primary Volume Descriptor signature (`\x01CD001`) at LBA 16,
 /// falling back to raw sync/mode inspection when fewer than 17 sectors are present.
+#[must_use]
 pub fn detect_sector_mode(data: &[u8]) -> Option<SectorMode> {
     const PVD_MAGIC: &[u8; 6] = b"\x01CD001";
     const CANDIDATES: [SectorMode; 4] = [
@@ -745,6 +766,19 @@ mod tests {
         assert!(u8_to_bcd(100).is_err());
         assert!(bcd_to_u8(0x0A).is_err());
         assert!(bcd_to_u8(0xF0).is_err());
+
+        // Symmetry between Msf::to_bcd and Msf::from_bcd bounds checks
+        assert!(matches!(Msf::new(100, 0, 0).to_bcd(), Err(Error::Overflow)));
+        assert!(matches!(Msf::new(0, 60, 0).to_bcd(), Err(Error::Overflow)));
+        assert!(matches!(Msf::new(0, 0, 75).to_bcd(), Err(Error::Overflow)));
+        assert!(matches!(
+            Msf::from_bcd([0x00, 0x60, 0x00]),
+            Err(Error::Overflow)
+        ));
+        assert!(matches!(
+            Msf::from_bcd([0x00, 0x00, 0x75]),
+            Err(Error::Overflow)
+        ));
     }
 
     #[test]
@@ -843,5 +877,110 @@ mod tests {
         let mut bad = bytes;
         bad[4] ^= 1;
         assert!(Subheader::from_bytes(&bad).is_err());
+    }
+
+    #[test]
+    fn ecma130_all_zero_mode1_and_mode2_form1_golden_edc_ecc() {
+        let zero_user = [0u8; COOKED_SECTOR_SIZE];
+
+        // Mode 2 Form 1 with all-zero subheader and all-zero user data:
+        // EDC is 0x0000_0000 and P/Q ECC parity blocks are all zero.
+        let m2_zero = build_mode2_form1_sector(0, &zero_user, Subheader::default()).unwrap();
+        verify_mode2_form1_edc_ecc(&m2_zero).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                m2_zero[MODE2_FORM1_EDC_OFFSET..MODE2_FORM1_EDC_OFFSET + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x0000_0000
+        );
+        assert!(m2_zero[MODE2_FORM1_ECC_P_OFFSET..RAW_SECTOR_SIZE]
+            .iter()
+            .all(|&b| b == 0));
+
+        // Mode 2 Form 1 with SUBMODE_DATA (0x08) and all-zero user data:
+        // Golden ECMA-130 EDC over 2056 bytes is 0x9481_880B.
+        let m2_data =
+            build_mode2_form1_sector(0, &zero_user, Subheader::new(0, 0, SUBMODE_DATA, 0)).unwrap();
+        verify_mode2_form1_edc_ecc(&m2_data).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                m2_data[MODE2_FORM1_EDC_OFFSET..MODE2_FORM1_EDC_OFFSET + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x9481_880B
+        );
+
+        // Mode 1 at LBA 0 (header 00:02:00, mode 1) with all-zero user data:
+        // Golden ECMA-130 EDC over bytes 0..2064 is 0x2B68_13C5.
+        let m1_zero = build_mode1_sector(0, &zero_user).unwrap();
+        verify_mode1_edc_ecc(&m1_zero).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                m1_zero[MODE1_EDC_OFFSET..MODE1_EDC_OFFSET + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x2B68_13C5
+        );
+    }
+
+    #[test]
+    fn mode1_ecc_and_intermediate_zero_corruption_detection() {
+        let user = [0x5Au8; COOKED_SECTOR_SIZE];
+        let mut raw = build_mode1_sector(32, &user).unwrap();
+        verify_mode1_edc_ecc(&raw).unwrap();
+
+        // Corrupt 8-byte intermediate zero field -> BadEcc
+        raw[MODE1_EDC_OFFSET + 4] = 0x01;
+        assert!(matches!(verify_mode1_edc_ecc(&raw), Err(Error::BadEcc)));
+        regenerate_mode1_edc_ecc(&mut raw);
+        verify_mode1_edc_ecc(&raw).unwrap();
+
+        // Corrupt P-parity -> BadEcc
+        raw[MODE2_FORM1_ECC_P_OFFSET + 10] ^= 0x40;
+        assert!(matches!(verify_mode1_edc_ecc(&raw), Err(Error::BadEcc)));
+        regenerate_mode1_edc_ecc(&mut raw);
+
+        // Corrupt Q-parity -> BadEcc
+        raw[MODE2_FORM1_ECC_Q_OFFSET + 5] ^= 0x02;
+        assert!(matches!(verify_mode1_edc_ecc(&raw), Err(Error::BadEcc)));
+    }
+
+    #[test]
+    fn mode2_form2_edc_verify_corrupt_and_allow_zero() {
+        let mut raw = [0u8; RAW_SECTOR_SIZE];
+        raw[..12].copy_from_slice(&SYNC_PATTERN);
+        raw[15] = 2;
+        let sub = Subheader::new(1, 0, SUBMODE_FORM2 | SUBMODE_AUDIO | SUBMODE_REALTIME, 0x01);
+        raw[16..24].copy_from_slice(&sub.to_bytes());
+        for (i, b) in raw[24..MODE2_FORM2_EDC_OFFSET].iter_mut().enumerate() {
+            *b = ((i * 17 + 11) & 0xFF) as u8;
+        }
+
+        regenerate_mode2_form2_edc(&mut raw);
+        verify_mode2_form2_edc(&raw).unwrap();
+        verify_mode2_form2_edc_allow_zero(&raw).unwrap();
+
+        // Corrupt payload -> BadEdc for both strict and allow-zero
+        raw[100] ^= 0x01;
+        assert!(matches!(
+            verify_mode2_form2_edc(&raw),
+            Err(Error::BadEdc { .. })
+        ));
+        assert!(matches!(
+            verify_mode2_form2_edc_allow_zero(&raw),
+            Err(Error::BadEdc { .. })
+        ));
+
+        // Zeroed EDC -> rejected by strict, accepted by allow-zero
+        raw[MODE2_FORM2_EDC_OFFSET..RAW_SECTOR_SIZE].fill(0);
+        assert!(matches!(
+            verify_mode2_form2_edc(&raw),
+            Err(Error::BadEdc { actual: 0, .. })
+        ));
+        verify_mode2_form2_edc_allow_zero(&raw).unwrap();
     }
 }

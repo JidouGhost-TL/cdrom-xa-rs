@@ -30,6 +30,7 @@ pub enum TrackMode {
 
 impl TrackMode {
     /// Returns the corresponding [`SectorMode`] for data tracks, or `None` for audio tracks.
+    #[must_use]
     pub const fn sector_mode(self) -> Option<SectorMode> {
         match self {
             TrackMode::Audio => None,
@@ -41,6 +42,7 @@ impl TrackMode {
     }
 
     /// Stored byte size per sector for this track mode.
+    #[must_use]
     pub const fn sector_size(self) -> usize {
         match self {
             TrackMode::Audio => RAW_SECTOR_SIZE,
@@ -78,6 +80,7 @@ pub struct CueTrack {
 
 impl CueTrack {
     /// Look up the [`Msf`] position of a specific index number (e.g. `0` or `1`).
+    #[must_use]
     pub fn index(&self, number: u8) -> Option<Msf> {
         self.indexes
             .iter()
@@ -105,8 +108,9 @@ pub struct CueSheet {
 }
 
 impl CueSheet {
-    /// Parse a CUE sheet from UTF-8 text.
+    /// Parse a CUE sheet from UTF-8 text (stripping a leading UTF-8 BOM if present).
     pub fn parse(text: &str) -> Result<Self> {
+        let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
         let mut files: Vec<CueFile> = Vec::new();
         let mut total_tracks = 0usize;
         let mut last_track_number: Option<u8> = None;
@@ -252,6 +256,7 @@ impl CueSheet {
     }
 
     /// Return the first data track (non-audio) and its enclosing [`CueFile`], if any.
+    #[must_use]
     pub fn first_data_track(&self) -> Option<(&CueFile, &CueTrack)> {
         self.tracks()
             .find(|(_, track)| track.mode.sector_mode().is_some())
@@ -391,5 +396,17 @@ FILE \"disc.bin\" BINARY
             CueSheet::parse("FILE x.bin BINARY\n TRACK 01 AUDIO\n INDEX 01 00:00:75\n").is_err()
         );
         assert!(CueSheet::parse("FILE x.bin BINARY\n TRACK 02 AUDIO\n TRACK 01 AUDIO\n").is_err());
+    }
+
+    #[test]
+    fn parses_utf8_bom_and_crlf_cue_sheet() {
+        let text = "\u{FEFF}FILE \"disc.bin\" BINARY\r\n  TRACK 01 MODE2/2352\r\n    INDEX 01 00:00:00\r\n  TRACK 02 AUDIO\r\n    INDEX 00 05:00:00\r\n    INDEX 01 05:02:00\r\n";
+        let cue = CueSheet::parse(text).unwrap();
+        assert_eq!(cue.files.len(), 1);
+        assert_eq!(cue.files[0].filename, "disc.bin");
+        assert_eq!(cue.files[0].tracks.len(), 2);
+        assert_eq!(cue.files[0].tracks[0].mode, TrackMode::Mode2_2352);
+        assert_eq!(cue.files[0].tracks[1].index(0), Some(Msf::new(5, 0, 0)));
+        assert_eq!(cue.files[0].tracks[1].index(1), Some(Msf::new(5, 2, 0)));
     }
 }

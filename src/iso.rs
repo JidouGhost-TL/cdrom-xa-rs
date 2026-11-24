@@ -7,9 +7,9 @@
 
 use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
-#[cfg(any(feature = "std", test))]
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt;
 
 #[cfg(feature = "std")]
 use alloc::boxed::Box;
@@ -55,6 +55,7 @@ pub struct XaAttributes {
 
 impl XaAttributes {
     /// Parse a 14-byte CD-ROM XA System Use extension if the `"XA"` signature is present.
+    #[must_use]
     pub fn parse(system_use: &[u8]) -> Option<Self> {
         if system_use.len() < 14 || &system_use[6..8] != b"XA" {
             return None;
@@ -68,26 +69,31 @@ impl XaAttributes {
     }
 
     /// Returns `true` if the Mode 2 Form 1 flag (bit 11, `0x0800`) is set.
+    #[must_use]
     pub const fn is_mode2_form1(self) -> bool {
         self.attributes & 0x0800 != 0
     }
 
     /// Returns `true` if the Mode 2 Form 2 flag (bit 12, `0x1000`) is set.
+    #[must_use]
     pub const fn is_mode2_form2(self) -> bool {
         self.attributes & 0x1000 != 0
     }
 
     /// Returns `true` if the Interleaved flag (bit 13, `0x2000`) is set.
+    #[must_use]
     pub const fn is_interleaved(self) -> bool {
         self.attributes & 0x2000 != 0
     }
 
     /// Returns `true` if the CD-DA audio flag (bit 14, `0x4000`) is set.
+    #[must_use]
     pub const fn is_cdda(self) -> bool {
         self.attributes & 0x4000 != 0
     }
 
     /// Returns `true` if the Directory flag (bit 15, `0x8000`) is set.
+    #[must_use]
     pub const fn is_directory(self) -> bool {
         self.attributes & 0x8000 != 0
     }
@@ -123,11 +129,21 @@ impl PrimaryVolumeDescriptor {
         if block[0] != 0x01 || &block[1..6] != b"CD001" {
             return Err(Error::InvalidIso("missing Primary Volume Descriptor magic"));
         }
+        if block[6] != 0x01 {
+            return Err(Error::InvalidIso(
+                "unsupported Primary Volume Descriptor version",
+            ));
+        }
         let system_id = trim_iso_str(&block[8..40]);
         let volume_id = trim_iso_str(&block[40..72]);
-        let volume_space_size = read_u32_le(block, 80)?;
-        let logical_block_size = read_u16_le(block, 128)?;
-        let path_table_size = read_u32_le(block, 132)?;
+        let volume_space_size = read_both_endian_u32(block, 80)?;
+        let logical_block_size = read_both_endian_u16(block, 128)?;
+        if usize::from(logical_block_size) != COOKED_SECTOR_SIZE {
+            return Err(Error::InvalidIso(
+                "unsupported logical block size (expected 2048)",
+            ));
+        }
+        let path_table_size = read_both_endian_u32(block, 132)?;
         let path_table_lba = read_u32_le(block, 140)?;
         let root_raw = parse_dir_entry(&block[PVD_ROOT_RECORD_OFFSET..])?;
         Ok(Self {
@@ -201,6 +217,19 @@ pub struct IsoImage {
     mode: SectorMode,
     sector_count: u32,
     pvd: PrimaryVolumeDescriptor,
+    has_trailing_tracks: bool,
+}
+
+impl fmt::Debug for IsoImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IsoImage")
+            .field("mode", &self.mode)
+            .field("sector_count", &self.sector_count)
+            .field("stored_len", &self.stored_len())
+            .field("has_trailing_tracks", &self.has_trailing_tracks)
+            .field("volume_id", &self.pvd.volume_id)
+            .finish()
+    }
 }
 
 impl IsoImage {
@@ -227,7 +256,7 @@ impl IsoImage {
         let sectors_usize = data.len() / stride;
         let sector_count = u32::try_from(sectors_usize).map_err(|_| Error::Overflow)?;
         let source = ImageSource::Bytes(data);
-        Self::finish_mount(source, mode, sector_count)
+        Self::finish_mount(source, mode, sector_count, false)
     }
 
     /// Mount an ISO-9660 image from any `Read + Seek` stream, auto-detecting the [`SectorMode`].
@@ -236,7 +265,7 @@ impl IsoImage {
         let byte_len = reader.seek(SeekFrom::End(0))?;
         let mode = detect_sector_mode_reader(&mut reader, 0, byte_len)
             .ok_or(Error::InvalidIso("unable to detect CD-ROM sector layout"))?;
-        Self::from_reader_range(reader, 0, byte_len, mode)
+        Self::from_reader_range(reader, 0, byte_len, mode, false)
     }
 
     /// Mount an ISO-9660 image from any `Read + Seek` stream with an explicit [`SectorMode`].
@@ -246,7 +275,7 @@ impl IsoImage {
         mode: SectorMode,
     ) -> Result<Self> {
         let byte_len = reader.seek(SeekFrom::End(0))?;
-        Self::from_reader_range(reader, 0, byte_len, mode)
+        Self::from_reader_range(reader, 0, byte_len, mode, false)
     }
 
     #[cfg(feature = "std")]
@@ -255,6 +284,7 @@ impl IsoImage {
         base_offset: u64,
         byte_len: u64,
         mode: SectorMode,
+        has_trailing_tracks: bool,
     ) -> Result<Self> {
         let stride = mode.stride() as u64;
         let sector_count = u32::try_from(byte_len / stride).map_err(|_| Error::Overflow)?;
@@ -263,14 +293,17 @@ impl IsoImage {
             base_offset,
             byte_len,
         };
-        Self::finish_mount(source, mode, sector_count)
+        Self::finish_mount(source, mode, sector_count, has_trailing_tracks)
     }
 
     /// Open a `.cue`, `.bin`, or `.iso` image file from disk.
     ///
     /// When given a `.cue` sheet, parses the sheet and opens the first data
     /// track's backing `.bin` file with its declared [`SectorMode`] and track
-    /// offset. Otherwise opens the image directly and auto-detects its layout.
+    /// offset. If subsequent tracks exist in the same `.bin` file, the mounted
+    /// slice is clamped to the next track's `INDEX 00`/`01` byte offset and
+    /// [`IsoImage::has_trailing_tracks`] returns `true`. Otherwise opens the
+    /// image directly and auto-detects its layout.
     #[cfg(feature = "std")]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -281,9 +314,17 @@ impl IsoImage {
         if is_cue {
             let text = std::fs::read_to_string(path)?;
             let cue = CueSheet::parse(&text)?;
-            let (cue_file, track) = cue
-                .first_data_track()
+            let (cue_file, track_idx) = cue
+                .files
+                .iter()
+                .find_map(|f| {
+                    f.tracks
+                        .iter()
+                        .position(|t| t.mode.sector_mode().is_some())
+                        .map(|idx| (f, idx))
+                })
                 .ok_or(Error::InvalidCue("CUE sheet contains no data track"))?;
+            let track = &cue_file.tracks[track_idx];
             let mode = track
                 .mode
                 .sector_mode()
@@ -305,14 +346,48 @@ impl IsoImage {
             if base_offset > total_len {
                 return Err(Error::UnexpectedEof);
             }
-            return Self::from_reader_range(file, base_offset, total_len - base_offset, mode);
+            let (end_offset, has_trailing_tracks) =
+                if let Some(next_track) = cue_file.tracks.get(track_idx + 1) {
+                    let clamped_end = if let Some(next_frame) = next_track
+                        .index(0)
+                        .or_else(|| next_track.index(1))
+                        .map(|m| m.to_frames() as u64)
+                    {
+                        let next_offset = next_frame
+                            .checked_mul(mode.stride() as u64)
+                            .ok_or(Error::Overflow)?;
+                        if next_offset < base_offset {
+                            return Err(Error::InvalidCue(
+                                "subsequent track starts before data track",
+                            ));
+                        }
+                        next_offset.min(total_len)
+                    } else {
+                        total_len
+                    };
+                    (clamped_end, true)
+                } else {
+                    (total_len, false)
+                };
+            return Self::from_reader_range(
+                file,
+                base_offset,
+                end_offset - base_offset,
+                mode,
+                has_trailing_tracks,
+            );
         }
 
         let file = File::open(path)?;
         Self::from_reader(file)
     }
 
-    fn finish_mount(source: ImageSource, mode: SectorMode, sector_count: u32) -> Result<Self> {
+    fn finish_mount(
+        source: ImageSource,
+        mode: SectorMode,
+        sector_count: u32,
+        has_trailing_tracks: bool,
+    ) -> Result<Self> {
         let pvd_raw = read_raw_from_source(&source, mode, sector_count, PVD_LBA)?;
         let pvd_user = extract_user_data(&pvd_raw, mode)?;
         let pvd = PrimaryVolumeDescriptor::parse(pvd_user)?;
@@ -321,20 +396,24 @@ impl IsoImage {
             mode,
             sector_count,
             pvd,
+            has_trailing_tracks,
         })
     }
 
     /// Detected or configured physical [`SectorMode`].
+    #[must_use]
     pub const fn mode(&self) -> SectorMode {
         self.mode
     }
 
     /// Total number of complete sectors available in the image.
+    #[must_use]
     pub const fn sector_count(&self) -> u32 {
         self.sector_count
     }
 
     /// Total stored byte length of the underlying image (or track slice).
+    #[must_use]
     pub fn stored_len(&self) -> u64 {
         match &self.source {
             ImageSource::Bytes(buf) => buf.len() as u64,
@@ -343,7 +422,15 @@ impl IsoImage {
         }
     }
 
+    /// Returns `true` if this image was opened from a single-BIN `.cue` sheet
+    /// containing additional tracks (e.g. CD-DA audio) after the mounted data track.
+    #[must_use]
+    pub const fn has_trailing_tracks(&self) -> bool {
+        self.has_trailing_tracks
+    }
+
     /// Borrow the parsed [`PrimaryVolumeDescriptor`].
+    #[must_use]
     pub const fn pvd(&self) -> &PrimaryVolumeDescriptor {
         &self.pvd
     }
@@ -353,15 +440,47 @@ impl IsoImage {
         read_raw_from_source(&self.source, self.mode, self.sector_count, lba)
     }
 
+    /// Read one complete stored sector at `lba` directly into `buf`.
+    ///
+    /// `buf.len()` must equal `self.mode().stride()`.
+    pub fn read_sector_raw_into(&self, lba: u32, buf: &mut [u8]) -> Result<()> {
+        if buf.len() != self.mode.stride() {
+            return Err(Error::InvalidSectorSize(buf.len()));
+        }
+        self.read_sectors_raw_into(lba, 1, buf)
+    }
+
+    pub(crate) fn read_sectors_raw_into(
+        &self,
+        start_lba: u32,
+        count: u32,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        read_sectors_raw_into_source(
+            &self.source,
+            self.mode,
+            self.sector_count,
+            start_lba,
+            count,
+            buf,
+        )
+    }
+
     /// Read the 2048-byte cooked user data of logical block `lba`.
+    ///
+    /// Returns [`Error::InvalidIso`] if the sector is a Mode 2 Form 2 sector
+    /// (2324-byte payload); use [`IsoImage::read_sector_raw`] or
+    /// [`IsoImage::read_file_raw_sectors`] for Form 2 sectors.
     pub fn read_sector_cooked(&self, lba: u32) -> Result<[u8; COOKED_SECTOR_SIZE]> {
         let raw = self.read_sector_raw(lba)?;
         let user = extract_user_data(&raw, self.mode)?;
-        if user.len() < COOKED_SECTOR_SIZE {
-            return Err(Error::UnexpectedEof);
+        if user.len() != COOKED_SECTOR_SIZE {
+            return Err(Error::InvalidIso(
+                "cannot read Mode 2 Form 2 sector as cooked 2048-byte data; use read_file_raw_sectors",
+            ));
         }
         let mut block = [0u8; COOKED_SECTOR_SIZE];
-        block.copy_from_slice(&user[..COOKED_SECTOR_SIZE]);
+        block.copy_from_slice(user);
         Ok(block)
     }
 
@@ -480,10 +599,9 @@ impl IsoImage {
         let total_bytes = (sectors as usize)
             .checked_mul(self.mode.stride())
             .ok_or(Error::Overflow)?;
-        let mut out = Vec::with_capacity(total_bytes);
-        for i in 0..sectors {
-            let raw = self.read_sector_raw(record.lba + i)?;
-            out.extend_from_slice(&raw);
+        let mut out = vec![0u8; total_bytes];
+        if sectors > 0 {
+            self.read_sectors_raw_into(record.lba, sectors, &mut out)?;
         }
         Ok(out)
     }
@@ -549,7 +667,10 @@ impl IsoImage {
                 is_dir,
                 xa_attributes: entry.xa_attributes,
             });
-            if is_dir && visited.insert(child_lba) {
+            if is_dir {
+                if !visited.insert(child_lba) {
+                    return Err(Error::InvalidIso("cyclic directory reference"));
+                }
                 self.walk_dir(child_lba, child_size, &path, depth + 1, visited, out)?;
             }
         }
@@ -571,8 +692,8 @@ pub(crate) fn parse_dir_entry(bytes: &[u8]) -> Result<RawDirEntry> {
         return Err(Error::InvalidIso("directory record too short"));
     }
     let rec = &bytes[..len];
-    let lba = read_u32_le(rec, 2)?;
-    let size = read_u32_le(rec, 10)?;
+    let lba = read_both_endian_u32(rec, 2)?;
+    let size = read_both_endian_u32(rec, 10)?;
     let flags = rec[25];
     let name_len = rec[32] as usize;
     let name_end = DIR_RECORD_FIXED_LEN
@@ -627,14 +748,86 @@ fn trim_iso_str(field: &[u8]) -> String {
         .to_string()
 }
 
-fn read_u16_le(bytes: &[u8], off: usize) -> Result<u16> {
-    let slice = bytes.get(off..off + 2).ok_or(Error::UnexpectedEof)?;
-    Ok(u16::from_le_bytes([slice[0], slice[1]]))
+fn read_both_endian_u16(bytes: &[u8], off: usize) -> Result<u16> {
+    let slice = bytes.get(off..off + 4).ok_or(Error::UnexpectedEof)?;
+    let le = u16::from_le_bytes([slice[0], slice[1]]);
+    let be = u16::from_be_bytes([slice[2], slice[3]]);
+    if le != be {
+        return Err(Error::InvalidIso("mismatched both-endian u16 field"));
+    }
+    Ok(le)
+}
+
+fn read_both_endian_u32(bytes: &[u8], off: usize) -> Result<u32> {
+    let slice = bytes.get(off..off + 8).ok_or(Error::UnexpectedEof)?;
+    let le = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
+    let be = u32::from_be_bytes([slice[4], slice[5], slice[6], slice[7]]);
+    if le != be {
+        return Err(Error::InvalidIso("mismatched both-endian u32 field"));
+    }
+    Ok(le)
 }
 
 fn read_u32_le(bytes: &[u8], off: usize) -> Result<u32> {
     let slice = bytes.get(off..off + 4).ok_or(Error::UnexpectedEof)?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_sectors_raw_into_source(
+    source: &ImageSource,
+    mode: SectorMode,
+    sector_count: u32,
+    start_lba: u32,
+    count: u32,
+    buf: &mut [u8],
+) -> Result<()> {
+    let stride = mode.stride();
+    let expected_len = (count as usize)
+        .checked_mul(stride)
+        .ok_or(Error::Overflow)?;
+    if buf.len() != expected_len {
+        return Err(Error::InvalidSectorSize(buf.len()));
+    }
+    if count == 0 {
+        return Ok(());
+    }
+    let end_lba = start_lba.checked_add(count).ok_or(Error::Overflow)?;
+    if end_lba > sector_count {
+        return Err(Error::UnexpectedEof);
+    }
+    match source {
+        ImageSource::Bytes(src) => {
+            let start = (start_lba as usize)
+                .checked_mul(stride)
+                .ok_or(Error::Overflow)?;
+            let end = start.checked_add(expected_len).ok_or(Error::Overflow)?;
+            let slice = src.get(start..end).ok_or(Error::UnexpectedEof)?;
+            buf.copy_from_slice(slice);
+            Ok(())
+        }
+        #[cfg(feature = "std")]
+        ImageSource::Reader {
+            inner,
+            base_offset,
+            byte_len,
+        } => {
+            let rel = u64::from(start_lba)
+                .checked_mul(stride as u64)
+                .ok_or(Error::Overflow)?;
+            let read_len = expected_len as u64;
+            let rel_end = rel.checked_add(read_len).ok_or(Error::Overflow)?;
+            if rel_end > *byte_len {
+                return Err(Error::UnexpectedEof);
+            }
+            let abs = base_offset.checked_add(rel).ok_or(Error::Overflow)?;
+            let mut guard = inner
+                .lock()
+                .map_err(|_| Error::InvalidIso("reader lock poisoned"))?;
+            guard.seek(SeekFrom::Start(abs))?;
+            guard.read_exact(buf)?;
+            Ok(())
+        }
+    }
 }
 
 fn read_raw_from_source(
@@ -643,39 +836,9 @@ fn read_raw_from_source(
     sector_count: u32,
     lba: u32,
 ) -> Result<Vec<u8>> {
-    if lba >= sector_count {
-        return Err(Error::UnexpectedEof);
-    }
-    let stride = mode.stride();
-    match source {
-        ImageSource::Bytes(buf) => {
-            let start = (lba as usize).checked_mul(stride).ok_or(Error::Overflow)?;
-            let end = start.checked_add(stride).ok_or(Error::Overflow)?;
-            let slice = buf.get(start..end).ok_or(Error::UnexpectedEof)?;
-            Ok(slice.to_vec())
-        }
-        #[cfg(feature = "std")]
-        ImageSource::Reader {
-            inner,
-            base_offset,
-            byte_len,
-        } => {
-            let rel = (lba as u64)
-                .checked_mul(stride as u64)
-                .ok_or(Error::Overflow)?;
-            if rel + stride as u64 > *byte_len {
-                return Err(Error::UnexpectedEof);
-            }
-            let abs = base_offset.checked_add(rel).ok_or(Error::Overflow)?;
-            let mut guard = inner
-                .lock()
-                .map_err(|_| Error::InvalidIso("reader lock poisoned"))?;
-            guard.seek(SeekFrom::Start(abs))?;
-            let mut buf = vec![0u8; stride];
-            guard.read_exact(&mut buf)?;
-            Ok(buf)
-        }
-    }
+    let mut buf = vec![0u8; mode.stride()];
+    read_sectors_raw_into_source(source, mode, sector_count, lba, 1, &mut buf)?;
+    Ok(buf)
 }
 
 #[cfg(feature = "std")]
@@ -944,5 +1107,160 @@ mod tests {
             iso.read_file(&readme).unwrap(),
             b"Hello from generic ISO-9660 disc"
         );
+    }
+
+    #[test]
+    fn rejects_bad_both_endian_fields_and_invalid_pvd() {
+        let base = test_helpers::build_synthetic_blocks();
+
+        // Bad PVD version (block[6] != 0x01)
+        let mut bad_ver = base[16];
+        bad_ver[6] = 0x02;
+        assert!(matches!(
+            PrimaryVolumeDescriptor::parse(&bad_ver),
+            Err(Error::InvalidIso(_))
+        ));
+
+        // Mismatched both-endian volume_space_size
+        let mut bad_vol = base[16];
+        bad_vol[84] ^= 0xFF;
+        assert!(matches!(
+            PrimaryVolumeDescriptor::parse(&bad_vol),
+            Err(Error::InvalidIso(_))
+        ));
+
+        // Mismatched both-endian logical_block_size
+        let mut bad_lbs_be = base[16];
+        bad_lbs_be[130] ^= 0xFF;
+        assert!(matches!(
+            PrimaryVolumeDescriptor::parse(&bad_lbs_be),
+            Err(Error::InvalidIso(_))
+        ));
+
+        // Non-2048 logical_block_size
+        let mut bad_lbs_val = base[16];
+        bad_lbs_val[128..130].copy_from_slice(&1024u16.to_le_bytes());
+        bad_lbs_val[130..132].copy_from_slice(&1024u16.to_be_bytes());
+        assert!(matches!(
+            PrimaryVolumeDescriptor::parse(&bad_lbs_val),
+            Err(Error::InvalidIso(_))
+        ));
+
+        // Mismatched both-endian path_table_size
+        let mut bad_pt = base[16];
+        bad_pt[136] = 0x01;
+        assert!(matches!(
+            PrimaryVolumeDescriptor::parse(&bad_pt),
+            Err(Error::InvalidIso(_))
+        ));
+
+        // Mismatched both-endian directory record lba and size
+        let mut rec = test_helpers::make_dir_record(b"FILE.BIN;1", 20, 64, false, None);
+        rec[6] ^= 0x01;
+        assert!(matches!(parse_dir_entry(&rec), Err(Error::InvalidIso(_))));
+
+        let mut rec2 = test_helpers::make_dir_record(b"FILE.BIN;1", 20, 64, false, None);
+        rec2[14] ^= 0x01;
+        assert!(matches!(parse_dir_entry(&rec2), Err(Error::InvalidIso(_))));
+    }
+
+    #[test]
+    fn reads_multi_sector_directory_with_zero_padding() {
+        let mut blocks = test_helpers::build_synthetic_blocks();
+        // Expand root directory at LBA 18..20 (2 sectors = 4096 bytes), putting /DATA in sector 18
+        // followed by zero padding (`record_len == 0`) and /SECOND.TXT in sector 19.
+        let root_rec =
+            test_helpers::make_dir_record(&[0x00], 18, (COOKED_SECTOR_SIZE * 2) as u32, true, None);
+        blocks[16][156..156 + root_rec.len()].copy_from_slice(&root_rec);
+
+        blocks[18].fill(0);
+        let mut cur = 0;
+        for rec in [
+            test_helpers::make_dir_record(&[0x00], 18, (COOKED_SECTOR_SIZE * 2) as u32, true, None),
+            test_helpers::make_dir_record(&[0x01], 18, (COOKED_SECTOR_SIZE * 2) as u32, true, None),
+            test_helpers::make_dir_record(b"README.TXT;1", 20, 32, false, None),
+        ] {
+            blocks[18][cur..cur + rec.len()].copy_from_slice(&rec);
+            cur += rec.len();
+        }
+        // Remaining bytes in block 18 are 0 (padding); put SECOND.TXT at start of block 19.
+        blocks[19].fill(0);
+        let second = test_helpers::make_dir_record(b"SECOND.TXT;1", 21, 16, false, None);
+        blocks[19][..second.len()].copy_from_slice(&second);
+
+        let mut raw = Vec::new();
+        for b in &blocks {
+            raw.extend_from_slice(b);
+        }
+        let iso = IsoImage::from_bytes(&raw).unwrap();
+        let recs = iso.records().unwrap();
+        assert_eq!(recs.len(), 2);
+        assert!(iso.find("/README.TXT").unwrap().is_some());
+        let found = iso.find("/SECOND.TXT").unwrap().unwrap();
+        assert_eq!(found.lba, 21);
+        assert_eq!(found.size, 16);
+    }
+
+    #[test]
+    fn rejects_cyclic_directory_in_both_records_and_find() {
+        let mut blocks = test_helpers::build_synthetic_blocks();
+        // Make /DATA (LBA 19) contain a subdirectory LOOP pointing back to root (LBA 18).
+        blocks[19].fill(0);
+        let mut cur = 0;
+        for rec in [
+            test_helpers::make_dir_record(&[0x00], 19, COOKED_SECTOR_SIZE as u32, true, None),
+            test_helpers::make_dir_record(&[0x01], 18, COOKED_SECTOR_SIZE as u32, true, None),
+            test_helpers::make_dir_record(b"LOOP", 18, COOKED_SECTOR_SIZE as u32, true, None),
+        ] {
+            blocks[19][cur..cur + rec.len()].copy_from_slice(&rec);
+            cur += rec.len();
+        }
+        let mut raw = Vec::new();
+        for b in &blocks {
+            raw.extend_from_slice(b);
+        }
+        let iso = IsoImage::from_bytes(&raw).unwrap();
+        assert!(matches!(
+            iso.records(),
+            Err(Error::InvalidIso("cyclic directory reference"))
+        ));
+        assert!(matches!(
+            iso.find("/DATA/LOOP/README.TXT"),
+            Err(Error::InvalidIso("cyclic directory reference"))
+        ));
+    }
+
+    #[test]
+    fn rejects_form2_sector_in_read_sector_cooked_and_read_file() {
+        let bytes = build_synthetic_image(SectorMode::Mode2_2352);
+        let iso = IsoImage::from_bytes(&bytes).unwrap();
+
+        // LBA 22 is a Mode 2 Form 2 sector in build_synthetic_image
+        assert!(matches!(
+            iso.read_sector_cooked(22),
+            Err(Error::InvalidIso(_))
+        ));
+
+        let fake_form2_record = IsoRecord {
+            path: "/AUDIO.XA".to_string(),
+            name: "AUDIO.XA".to_string(),
+            lba: 22,
+            size: COOKED_SECTOR_SIZE as u32,
+            is_dir: false,
+            xa_attributes: None,
+        };
+        assert!(matches!(
+            iso.read_file(&fake_form2_record),
+            Err(Error::InvalidIso(_))
+        ));
+
+        // Reading raw sectors still succeeds and returns full 2352-byte framing.
+        let raw_secs = iso.read_file_raw_sectors(&fake_form2_record).unwrap();
+        assert_eq!(raw_secs.len(), RAW_SECTOR_SIZE);
+
+        let mut single = [0u8; RAW_SECTOR_SIZE];
+        iso.read_sector_raw_into(22, &mut single).unwrap();
+        assert_eq!(single.as_slice(), raw_secs.as_slice());
+        assert!(alloc::format!("{iso:?}").contains("IsoImage"));
     }
 }

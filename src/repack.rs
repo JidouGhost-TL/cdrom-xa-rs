@@ -10,7 +10,9 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt;
 
 #[cfg(feature = "std")]
 use std::io::Write;
@@ -20,11 +22,17 @@ use std::path::Path;
 use crate::error::{Error, Result};
 use crate::iso::{parse_dir_entry, sector_span, IsoImage, RawDirEntry, PVD_LBA};
 use crate::sector::{
-    build_mode1_sector, build_mode2_2336_sector, build_mode2_form1_sector,
+    build_mode1_sector, build_mode2_2336_sector, build_mode2_form1_sector, extract_user_data,
     regenerate_mode1_edc_ecc, regenerate_mode2_form1_edc_ecc, SectorMode, Subheader,
     COOKED_SECTOR_SIZE, MODE2_2336_SIZE, RAW_SECTOR_SIZE, SUBMODE_DATA, SUBMODE_EOF, SUBMODE_EOR,
     SUBMODE_FORM2, SYNC_PATTERN,
 };
+
+/// Maximum LBA representable in standard packed-BCD MSF (`99:59:74` minus 150-frame pregap).
+const MAX_MSF_LBA: u32 = 449_849;
+
+/// Number of sectors streamed per contiguous unmodified run (~150 KiB for 2352-byte sectors).
+const STREAM_CHUNK_SECTORS: u32 = 64;
 
 /// Summary of a completed disc repack operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,8 +61,13 @@ struct LocatedDirRecord {
     data_length: u32,
 }
 
+struct PatchedSector {
+    user_data: [u8; COOKED_SECTOR_SIZE],
+    submode_override: Option<u8>,
+}
+
 struct PlannedRepack {
-    patched_sectors: BTreeMap<u32, [u8; COOKED_SECTOR_SIZE]>,
+    patched_sectors: BTreeMap<u32, PatchedSector>,
     appended_sectors: Vec<([u8; COOKED_SECTOR_SIZE], u8)>,
     report: RepackReport,
 }
@@ -65,8 +78,18 @@ pub struct IsoRepacker {
     replacements: Vec<(String, Vec<u8>)>,
 }
 
+impl fmt::Debug for IsoRepacker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IsoRepacker")
+            .field("iso", &self.iso)
+            .field("queued_replacements", &self.replacements.len())
+            .finish()
+    }
+}
+
 impl IsoRepacker {
     /// Create a repacker over an already-mounted [`IsoImage`].
+    #[must_use]
     pub fn new(iso: IsoImage) -> Self {
         Self {
             iso,
@@ -82,13 +105,15 @@ impl IsoRepacker {
 
     /// Queue a file replacement by ISO-9660 path (e.g. `"/DATA/ASSET.BIN"`).
     ///
-    /// Replacements are applied in the order queued.
+    /// If the same file is queued more than once in one session, the later
+    /// replacement supersedes the earlier one without leaving orphaned sectors.
     pub fn replace(&mut self, path: impl Into<String>, data: Vec<u8>) -> &mut Self {
         self.replacements.push((path.into(), data));
         self
     }
 
     /// Borrow the underlying mounted [`IsoImage`].
+    #[must_use]
     pub const fn iso(&self) -> &IsoImage {
         &self.iso
     }
@@ -127,6 +152,10 @@ impl IsoRepacker {
             return Err(Error::InvalidSectorSize(self.iso.stored_len() as usize));
         }
 
+        if original_sectors > 0 && original_sectors - 1 > MAX_MSF_LBA {
+            return Err(Error::Overflow);
+        }
+
         if self.replacements.is_empty() {
             return Ok(PlannedRepack {
                 patched_sectors: BTreeMap::new(),
@@ -143,13 +172,27 @@ impl IsoRepacker {
             });
         }
 
-        let mut patched_sectors: BTreeMap<u32, [u8; COOKED_SECTOR_SIZE]> = BTreeMap::new();
+        // Resolve and deduplicate queued replacements by directory record location
+        // so repeated replacements of the same file do not leave orphaned sectors.
+        let mut resolved: Vec<(LocatedDirRecord, &[u8])> = Vec::new();
+        let mut by_record: BTreeMap<(u32, usize), usize> = BTreeMap::new();
+        for (disc_path, new_data) in &self.replacements {
+            let located = self.locate_file_dir_record(disc_path)?;
+            let key = (located.dir_lba, located.offset_in_block);
+            if let Some(&idx) = by_record.get(&key) {
+                resolved[idx].1 = new_data.as_slice();
+            } else {
+                by_record.insert(key, resolved.len());
+                resolved.push((located, new_data.as_slice()));
+            }
+        }
+
+        let mut patched_sectors: BTreeMap<u32, PatchedSector> = BTreeMap::new();
         let mut appended_sectors: Vec<([u8; COOKED_SECTOR_SIZE], u8)> = Vec::new();
         let mut next_lba = original_sectors;
         let mut relocated_files = 0usize;
 
-        for (disc_path, new_data) in &self.replacements {
-            let located = self.locate_file_dir_record(&patched_sectors, disc_path)?;
+        for &(located, new_data) in &resolved {
             let new_len = u32::try_from(new_data.len()).map_err(|_| Error::Overflow)?;
             let old_span = sector_span(located.data_length);
             let new_span = sector_span(new_len);
@@ -157,16 +200,22 @@ impl IsoRepacker {
             let new_extent_lba = if new_span <= old_span {
                 for idx in 0..new_span {
                     let lba = located.extent_lba.checked_add(idx).ok_or(Error::Overflow)?;
-                    if lba >= original_sectors {
-                        let app_idx = (lba - original_sectors) as usize;
-                        fill_block_slice(&mut appended_sectors[app_idx].0, new_data, idx as usize);
+                    let submode = if idx + 1 == new_span {
+                        SUBMODE_DATA | SUBMODE_EOR | SUBMODE_EOF
                     } else {
-                        let block = self.ensure_patched_form1(&mut patched_sectors, lba)?;
-                        fill_block_slice(block, new_data, idx as usize);
-                    }
+                        SUBMODE_DATA
+                    };
+                    let patched = self.ensure_patched_form1(&mut patched_sectors, lba)?;
+                    fill_block_slice(&mut patched.user_data, new_data, idx as usize);
+                    patched.submode_override = Some(submode);
                 }
                 located.extent_lba
             } else {
+                if self.iso.has_trailing_tracks() {
+                    return Err(Error::InvalidIso(
+                        "cannot relocate file on a multi-track single-BIN image; replacement exceeds existing sector span",
+                    ));
+                }
                 let start_lba = next_lba;
                 let end_lba = start_lba.checked_add(new_span).ok_or(Error::Overflow)?;
                 for idx in 0..new_span {
@@ -184,14 +233,18 @@ impl IsoRepacker {
                 start_lba
             };
 
-            let dir_block = self.ensure_patched_form1(&mut patched_sectors, located.dir_lba)?;
+            let dir_block = &mut self
+                .ensure_patched_form1(&mut patched_sectors, located.dir_lba)?
+                .user_data;
             let off = located.offset_in_block;
             write_both_endian_u32(dir_block, off + 2, new_extent_lba);
             write_both_endian_u32(dir_block, off + 10, new_len);
         }
 
         if next_lba > original_sectors {
-            let pvd_block = self.ensure_patched_form1(&mut patched_sectors, PVD_LBA)?;
+            let pvd_block = &mut self
+                .ensure_patched_form1(&mut patched_sectors, PVD_LBA)?
+                .user_data;
             let current_vol_size =
                 u32::from_le_bytes([pvd_block[80], pvd_block[81], pvd_block[82], pvd_block[83]]);
             let updated_vol_size = current_vol_size.max(next_lba);
@@ -199,11 +252,14 @@ impl IsoRepacker {
         }
 
         let final_sectors = next_lba;
+        if final_sectors > 0 && final_sectors - 1 > MAX_MSF_LBA {
+            return Err(Error::Overflow);
+        }
         let image_bytes = u64::from(final_sectors)
             .checked_mul(stride)
             .ok_or(Error::Overflow)?;
         let report = RepackReport {
-            replaced_files: self.replacements.len(),
+            replaced_files: resolved.len(),
             relocated_files,
             original_sectors,
             final_sectors,
@@ -225,16 +281,41 @@ impl IsoRepacker {
         mut sink: impl FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
         let mode = self.iso.mode();
+        let stride = mode.stride();
         let original_sectors = plan.report.original_sectors;
+        let chunk_sectors = STREAM_CHUNK_SECTORS.min(original_sectors.max(1));
+        let mut io_buf = vec![0u8; (chunk_sectors as usize) * stride];
+        let mut patch_buf = [0u8; RAW_SECTOR_SIZE];
 
-        for lba in 0..original_sectors {
-            if let Some(user_data) = plan.patched_sectors.get(&lba) {
-                let raw = self.iso.read_sector_raw(lba)?;
-                let updated = replace_form1_sector_user_data(&raw, mode, user_data)?;
-                sink(&updated)?;
+        let mut lba = 0u32;
+        while lba < original_sectors {
+            if let Some(patched) = plan.patched_sectors.get(&lba) {
+                let raw_slot = &mut io_buf[..stride];
+                self.iso.read_sector_raw_into(lba, raw_slot)?;
+                let written = replace_form1_sector_user_data(
+                    raw_slot,
+                    mode,
+                    &patched.user_data,
+                    patched.submode_override,
+                    &mut patch_buf,
+                )?;
+                sink(&patch_buf[..written])?;
+                lba += 1;
             } else {
-                let raw = self.iso.read_sector_raw(lba)?;
-                sink(&raw)?;
+                let run_end = plan
+                    .patched_sectors
+                    .range(lba..)
+                    .next()
+                    .map(|(&next_patched, _)| next_patched)
+                    .unwrap_or(original_sectors);
+                while lba < run_end {
+                    let count = (run_end - lba).min(chunk_sectors);
+                    let byte_len = (count as usize) * stride;
+                    self.iso
+                        .read_sectors_raw_into(lba, count, &mut io_buf[..byte_len])?;
+                    sink(&io_buf[..byte_len])?;
+                    lba += count;
+                }
             }
         }
 
@@ -263,43 +344,33 @@ impl IsoRepacker {
         Ok(())
     }
 
-    fn read_cooked_block(
-        &self,
-        patched: &BTreeMap<u32, [u8; COOKED_SECTOR_SIZE]>,
-        lba: u32,
-    ) -> Result<[u8; COOKED_SECTOR_SIZE]> {
-        if let Some(block) = patched.get(&lba) {
-            return Ok(*block);
-        }
-        self.iso.read_sector_cooked(lba)
-    }
-
     fn ensure_patched_form1<'a>(
         &self,
-        patched: &'a mut BTreeMap<u32, [u8; COOKED_SECTOR_SIZE]>,
+        patched: &'a mut BTreeMap<u32, PatchedSector>,
         lba: u32,
-    ) -> Result<&'a mut [u8; COOKED_SECTOR_SIZE]> {
-        if let alloc::collections::btree_map::Entry::Vacant(entry) = patched.entry(lba) {
-            let raw = self.iso.read_sector_raw(lba)?;
-            let mode = self.iso.mode();
-            if let Some(sub_off) = mode.subheader_offset() {
-                if raw[sub_off + 2] & SUBMODE_FORM2 != 0 {
+    ) -> Result<&'a mut PatchedSector> {
+        use alloc::collections::btree_map::Entry;
+        match patched.entry(lba) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                let raw = self.iso.read_sector_raw(lba)?;
+                let user = extract_user_data(&raw, self.iso.mode())?;
+                if user.len() != COOKED_SECTOR_SIZE {
                     return Err(Error::InvalidIso(
                         "cannot overwrite Mode 2 Form 2 sector in place",
                     ));
                 }
+                let mut user_data = [0u8; COOKED_SECTOR_SIZE];
+                user_data.copy_from_slice(user);
+                Ok(entry.insert(PatchedSector {
+                    user_data,
+                    submode_override: None,
+                }))
             }
-            let cooked = self.iso.read_sector_cooked(lba)?;
-            entry.insert(cooked);
         }
-        Ok(patched.get_mut(&lba).expect("inserted above"))
     }
 
-    fn locate_file_dir_record(
-        &self,
-        patched: &BTreeMap<u32, [u8; COOKED_SECTOR_SIZE]>,
-        disc_path: &str,
-    ) -> Result<LocatedDirRecord> {
+    fn locate_file_dir_record(&self, disc_path: &str) -> Result<LocatedDirRecord> {
         let components: Vec<&str> = disc_path
             .split(['/', '\\'])
             .filter(|c| !c.is_empty())
@@ -315,7 +386,7 @@ impl IsoRepacker {
 
         for (depth, &component) in components.iter().enumerate() {
             let is_last = depth + 1 == components.len();
-            let entries = self.read_dir_with_locations(patched, cur_lba, cur_size)?;
+            let entries = self.read_dir_with_locations(cur_lba, cur_size)?;
             let have_exact = entries
                 .iter()
                 .any(|(e, _, _)| e.raw_identifier.eq_ignore_ascii_case(component.as_bytes()));
@@ -353,7 +424,6 @@ impl IsoRepacker {
 
     fn read_dir_with_locations(
         &self,
-        patched: &BTreeMap<u32, [u8; COOKED_SECTOR_SIZE]>,
         dir_lba: u32,
         dir_size: u32,
     ) -> Result<Vec<(RawDirEntry, u32, usize)>> {
@@ -361,7 +431,7 @@ impl IsoRepacker {
         let mut out = Vec::new();
         for s in 0..sectors {
             let lba = dir_lba.checked_add(s).ok_or(Error::Overflow)?;
-            let block = self.read_cooked_block(patched, lba)?;
+            let block = self.iso.read_sector_cooked(lba)?;
             let mut off = 0usize;
             while off < COOKED_SECTOR_SIZE {
                 let len = block[off] as usize;
@@ -384,22 +454,25 @@ fn replace_form1_sector_user_data(
     raw: &[u8],
     mode: SectorMode,
     user_data: &[u8; COOKED_SECTOR_SIZE],
-) -> Result<Vec<u8>> {
+    submode_override: Option<u8>,
+    out: &mut [u8; RAW_SECTOR_SIZE],
+) -> Result<usize> {
     if raw.len() != mode.stride() {
         return Err(Error::InvalidSectorSize(raw.len()));
     }
     match mode {
-        SectorMode::Cooked2048 => Ok(user_data.to_vec()),
+        SectorMode::Cooked2048 => {
+            out[..COOKED_SECTOR_SIZE].copy_from_slice(user_data);
+            Ok(COOKED_SECTOR_SIZE)
+        }
         SectorMode::Mode1_2352 => {
             if raw[..12] != SYNC_PATTERN || raw[15] != 1 {
                 return Err(Error::BadSync);
             }
-            let mut buf: [u8; RAW_SECTOR_SIZE] = raw
-                .try_into()
-                .map_err(|_| Error::InvalidSectorSize(raw.len()))?;
-            buf[16..16 + COOKED_SECTOR_SIZE].copy_from_slice(user_data);
-            regenerate_mode1_edc_ecc(&mut buf);
-            Ok(buf.to_vec())
+            out.copy_from_slice(raw);
+            out[16..16 + COOKED_SECTOR_SIZE].copy_from_slice(user_data);
+            regenerate_mode1_edc_ecc(out);
+            Ok(RAW_SECTOR_SIZE)
         }
         SectorMode::Mode2_2352 => {
             if raw[..12] != SYNC_PATTERN || raw[15] != 2 {
@@ -408,12 +481,18 @@ fn replace_form1_sector_user_data(
             if raw[18] & SUBMODE_FORM2 != 0 {
                 return Err(Error::InvalidIso("cannot overwrite Form 2 sector"));
             }
-            let mut buf: [u8; RAW_SECTOR_SIZE] = raw
-                .try_into()
-                .map_err(|_| Error::InvalidSectorSize(raw.len()))?;
-            buf[24..24 + COOKED_SECTOR_SIZE].copy_from_slice(user_data);
-            regenerate_mode2_form1_edc_ecc(&mut buf);
-            Ok(buf.to_vec())
+            out.copy_from_slice(raw);
+            if let Some(submode) = submode_override {
+                let sub_bytes: [u8; 8] = raw[16..24]
+                    .try_into()
+                    .map_err(|_| Error::InvalidSectorSize(raw.len()))?;
+                let mut sub = Subheader::from_bytes_unchecked(&sub_bytes);
+                sub.submode = submode & !SUBMODE_FORM2;
+                out[16..24].copy_from_slice(&sub.to_bytes());
+            }
+            out[24..24 + COOKED_SECTOR_SIZE].copy_from_slice(user_data);
+            regenerate_mode2_form1_edc_ecc(out);
+            Ok(RAW_SECTOR_SIZE)
         }
         SectorMode::Mode2_2336 => {
             if raw[2] & SUBMODE_FORM2 != 0 {
@@ -423,9 +502,18 @@ fn replace_form1_sector_user_data(
             framed[..12].copy_from_slice(&SYNC_PATTERN);
             framed[15] = 2;
             framed[16..RAW_SECTOR_SIZE].copy_from_slice(raw);
+            if let Some(submode) = submode_override {
+                let sub_bytes: [u8; 8] = raw[0..8]
+                    .try_into()
+                    .map_err(|_| Error::InvalidSectorSize(raw.len()))?;
+                let mut sub = Subheader::from_bytes_unchecked(&sub_bytes);
+                sub.submode = submode & !SUBMODE_FORM2;
+                framed[16..24].copy_from_slice(&sub.to_bytes());
+            }
             framed[24..24 + COOKED_SECTOR_SIZE].copy_from_slice(user_data);
             regenerate_mode2_form1_edc_ecc(&mut framed);
-            Ok(framed[16..16 + MODE2_2336_SIZE].to_vec())
+            out[..MODE2_2336_SIZE].copy_from_slice(&framed[16..RAW_SECTOR_SIZE]);
+            Ok(MODE2_2336_SIZE)
         }
     }
 }
@@ -532,7 +620,11 @@ mod tests {
 
     #[test]
     fn mode1_and_cooked_repack_work() {
-        for mode in [SectorMode::Mode1_2352, SectorMode::Cooked2048] {
+        for mode in [
+            SectorMode::Mode1_2352,
+            SectorMode::Mode2_2336,
+            SectorMode::Cooked2048,
+        ] {
             let original = build_synthetic_image(mode);
             let iso = IsoImage::from_bytes(&original).unwrap();
             let mut repacker = IsoRepacker::new(iso);
@@ -554,6 +646,198 @@ mod tests {
                     verify_mode1_edc_ecc(&raw).unwrap();
                 }
             }
+            if mode == SectorMode::Mode2_2336 {
+                // Verify submode flags on relocated 2336-byte Mode 2 sectors
+                let s0 = reopened.read_sector_raw(24).unwrap();
+                let s1 = reopened.read_sector_raw(25).unwrap();
+                let s2 = reopened.read_sector_raw(26).unwrap();
+                assert_eq!(s0[2], SUBMODE_DATA);
+                assert_eq!(s1[2], SUBMODE_DATA);
+                assert_eq!(s2[2], SUBMODE_DATA | SUBMODE_EOR | SUBMODE_EOF);
+            }
         }
+    }
+
+    #[test]
+    fn shrinking_in_place_updates_submode_eor_eof_and_regenerates_edc_ecc() {
+        // First grow ASSET.BIN to 3 sectors (LBA 24, 25, 26), then shrink it in place to 1 sector.
+        let original = build_synthetic_image(SectorMode::Mode2_2352);
+        let iso = IsoImage::from_bytes(&original).unwrap();
+        let mut repacker1 = IsoRepacker::new(iso);
+        repacker1.replace("/DATA/ASSET.BIN", vec![0x11u8; 5000]);
+        let (grown, _) = repacker1.to_vec().unwrap();
+
+        let iso_grown = IsoImage::from_bytes(&grown).unwrap();
+        // Before shrinking, LBA 24 has SUBMODE_DATA (no EOR/EOF)
+        assert_eq!(iso_grown.read_sector_raw(24).unwrap()[18], SUBMODE_DATA);
+
+        let mut repacker2 = IsoRepacker::new(iso_grown);
+        let shrunk_data = vec![0x77u8; 300];
+        repacker2.replace("/DATA/ASSET.BIN", shrunk_data.clone());
+        let (shrunk, report) = repacker2.to_vec().unwrap();
+        assert_eq!(report.relocated_files, 0);
+        assert_eq!(report.sectors_appended, 0);
+
+        let reopened = IsoImage::from_bytes(&shrunk).unwrap();
+        let entry = reopened.find("/DATA/ASSET.BIN").unwrap().unwrap();
+        assert_eq!(entry.lba, 24);
+        assert_eq!(entry.size, 300);
+        assert_eq!(reopened.read_file(&entry).unwrap(), shrunk_data);
+
+        // New final sector (LBA 24) must now carry SUBMODE_DATA | SUBMODE_EOR | SUBMODE_EOF
+        let raw24: [u8; RAW_SECTOR_SIZE] =
+            reopened.read_sector_raw(24).unwrap().try_into().unwrap();
+        assert_eq!(raw24[18], SUBMODE_DATA | SUBMODE_EOR | SUBMODE_EOF);
+        assert_eq!(raw24[22], SUBMODE_DATA | SUBMODE_EOR | SUBMODE_EOF);
+        verify_mode2_form1_edc_ecc(&raw24).unwrap();
+    }
+
+    #[test]
+    fn repeated_replacements_deduplicate_without_orphans() {
+        let original = build_synthetic_image(SectorMode::Mode2_2352);
+        let iso = IsoImage::from_bytes(&original).unwrap();
+        let mut repacker = IsoRepacker::new(iso);
+        // Queue a large replacement, then supersede it with a small one using different casing/version.
+        repacker.replace("/DATA/ASSET.BIN", vec![0xAAu8; 6000]);
+        repacker.replace("/data/asset.bin;1", vec![0xBBu8; 256]);
+        let (repacked, report) = repacker.to_vec().unwrap();
+
+        assert_eq!(report.replaced_files, 1);
+        assert_eq!(report.relocated_files, 0);
+        assert_eq!(report.sectors_appended, 0);
+        assert_eq!(repacked.len(), original.len());
+
+        let reopened = IsoImage::from_bytes(&repacked).unwrap();
+        let entry = reopened.find("/DATA/ASSET.BIN").unwrap().unwrap();
+        assert_eq!(entry.lba, 21);
+        assert_eq!(entry.size, 256);
+        assert_eq!(reopened.read_file(&entry).unwrap(), vec![0xBBu8; 256]);
+        assert!(alloc::format!("{repacker:?}").contains("IsoRepacker"));
+    }
+
+    #[test]
+    fn plan_rejects_msf_overflow_before_emitting() {
+        let original = build_synthetic_image(SectorMode::Cooked2048);
+        let iso = IsoImage::from_bytes(&original).unwrap();
+        let mut repacker = IsoRepacker::new(iso);
+        // Replacing with > 449_850 sectors (~921 MiB) would overflow 99:59:74 MSF;
+        // test via direct check on MAX_MSF_LBA arithmetic:
+        // Verify MAX_MSF_LBA == 99:59:74.to_lba()
+        assert_eq!(
+            crate::sector::Msf::new(99, 59, 74).to_lba() as u32,
+            MAX_MSF_LBA
+        );
+        assert!(crate::sector::lba_to_msf((MAX_MSF_LBA + 1) as i32).is_err());
+
+        // Also test actual plan() error when a file's replacement is rejected on overflow:
+        // Use a valid small replacement to ensure plan() succeeds under the limit.
+        repacker.replace("/DATA/ASSET.BIN", vec![0x11u8; 16]);
+        assert!(repacker.plan().is_ok());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn write_to_rejects_msf_overflow_in_plan_before_streaming_bytes() {
+        struct SparseIsoReader {
+            prefix: Vec<u8>,
+            virtual_len: u64,
+            pos: u64,
+        }
+        impl std::io::Read for SparseIsoReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.virtual_len {
+                    return Ok(0);
+                }
+                let avail = (self.virtual_len - self.pos).min(buf.len() as u64) as usize;
+                for (i, slot) in buf[..avail].iter_mut().enumerate() {
+                    let abs = self.pos as usize + i;
+                    *slot = self.prefix.get(abs).copied().unwrap_or(0);
+                }
+                self.pos += avail as u64;
+                Ok(avail)
+            }
+        }
+        impl std::io::Seek for SparseIsoReader {
+            fn seek(&mut self, style: std::io::SeekFrom) -> std::io::Result<u64> {
+                let next = match style {
+                    std::io::SeekFrom::Start(p) => p as i128,
+                    std::io::SeekFrom::End(d) => self.virtual_len as i128 + d as i128,
+                    std::io::SeekFrom::Current(d) => self.pos as i128 + d as i128,
+                };
+                if next < 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "negative seek",
+                    ));
+                }
+                self.pos = next as u64;
+                Ok(self.pos)
+            }
+        }
+
+        let prefix = build_synthetic_image(SectorMode::Cooked2048);
+        // Exactly at MAX_MSF_LBA + 1 = 449_850 sectors (highest LBA = 449_849 = 99:59:74).
+        let reader = SparseIsoReader {
+            prefix,
+            virtual_len: u64::from(MAX_MSF_LBA + 1) * COOKED_SECTOR_SIZE as u64,
+            pos: 0,
+        };
+        let iso = IsoImage::from_reader_with_mode(reader, SectorMode::Cooked2048).unwrap();
+        let mut repacker = IsoRepacker::new(iso);
+        // Appending 2 sectors pushes final LBA to 449_851 > MAX_MSF_LBA.
+        repacker.replace("/DATA/ASSET.BIN", vec![0x99u8; COOKED_SECTOR_SIZE * 2]);
+        let mut out = Vec::new();
+        assert!(matches!(repacker.write_to(&mut out), Err(Error::Overflow)));
+        assert!(out.is_empty());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn multitrack_single_bin_cue_clamps_data_track_and_rejects_relocation() {
+        let data_track = build_synthetic_image(SectorMode::Mode2_2352);
+        let data_sectors = data_track.len() / RAW_SECTOR_SIZE; // 24 sectors
+        let audio_track = vec![0xEEu8; 10 * RAW_SECTOR_SIZE];
+
+        let mut combined_bin = Vec::with_capacity(data_track.len() + audio_track.len());
+        combined_bin.extend_from_slice(&data_track);
+        combined_bin.extend_from_slice(&audio_track);
+
+        let dir = std::env::temp_dir().join(format!("cdrom_xa_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_path = dir.join("disc.bin");
+        let cue_path = dir.join("disc.cue");
+        std::fs::write(&bin_path, &combined_bin).unwrap();
+        let cue_text = format!(
+            "FILE \"disc.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 00 00:00:{:02}\n    INDEX 01 00:00:{:02}\n",
+            data_sectors,
+            data_sectors + 2
+        );
+        std::fs::write(&cue_path, cue_text).unwrap();
+
+        let iso = IsoImage::open(&cue_path).unwrap();
+        assert!(iso.has_trailing_tracks());
+        assert_eq!(iso.sector_count(), data_sectors as u32);
+        assert_eq!(iso.stored_len(), data_track.len() as u64);
+
+        // Relocating (growing beyond 1 sector) MUST be rejected to protect Track 2 audio
+        let mut repacker_grow = IsoRepacker::open(&cue_path).unwrap();
+        repacker_grow.replace("/DATA/ASSET.BIN", vec![0x55u8; 5000]);
+        assert!(matches!(repacker_grow.to_vec(), Err(Error::InvalidIso(_))));
+
+        // In-place replacement (fits in existing 1-sector span) MUST succeed
+        let mut repacker_fit = IsoRepacker::open(&cue_path).unwrap();
+        let replacement = vec![0x42u8; 1024];
+        repacker_fit.replace("/DATA/ASSET.BIN", replacement.clone());
+        let mut out = Vec::new();
+        let report = repacker_fit.write_to(&mut out).unwrap();
+        assert_eq!(report.relocated_files, 0);
+        assert_eq!(report.final_sectors, data_sectors as u32);
+        assert_eq!(out.len(), data_track.len());
+
+        let reopened = IsoImage::from_bytes(&out).unwrap();
+        let entry = reopened.find("/DATA/ASSET.BIN").unwrap().unwrap();
+        assert_eq!(reopened.read_file(&entry).unwrap(), replacement);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

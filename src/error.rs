@@ -7,6 +7,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 /// Errors returned by CD-ROM / CD-ROM XA operations.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Input ended before the expected number of bytes were available.
     UnexpectedEof,
