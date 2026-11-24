@@ -179,6 +179,11 @@ impl Subheader {
     }
 
     /// Parse an 8-byte duplicated subheader, verifying that both 4-byte copies match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidXa`] if the first 4 bytes do not match the
+    /// duplicated second 4 bytes.
     pub fn from_bytes(bytes: &[u8; SUBHEADER_SIZE]) -> Result<Self> {
         if bytes[0..4] != bytes[4..8] {
             return Err(Error::InvalidXa("duplicated CD-ROM XA subheader mismatch"));
@@ -286,12 +291,22 @@ impl Msf {
         msf_to_lba(self)
     }
 
-    /// Convert a Logical Block Address (LBA >= -150) to an MSF address.
+    /// Convert a Logical Block Address (`lba >= -150`) to an MSF address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Overflow`] if `lba < -150` or if the resulting minute
+    /// count exceeds `99` (`lba > 449_849`).
     pub const fn from_lba(lba: i32) -> Result<Self> {
         lba_to_msf(lba)
     }
 
     /// Decode a 3-byte packed-BCD MSF address (as stored at raw sector bytes `12..15`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Overflow`] if any byte contains an invalid BCD nibble
+    /// (`> 9`) or if `sec >= 60` or `frame >= 75`.
     pub fn from_bcd(bytes: [u8; 3]) -> Result<Self> {
         let min = bcd_to_u8(bytes[0])?;
         let sec = bcd_to_u8(bytes[1])?;
@@ -306,6 +321,10 @@ impl Msf {
     ///
     /// Rejects out-of-range components (`min > 99`, `sec >= 60`, or `frame >= 75`)
     /// with [`Error::Overflow`], symmetric with [`Msf::from_bcd`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Overflow`] if `min > 99`, `sec >= 60`, or `frame >= 75`.
     pub fn to_bcd(self) -> Result<[u8; 3]> {
         if self.min > 99 || self.sec >= 60 || self.frame >= 75 {
             return Err(Error::Overflow);
@@ -332,6 +351,11 @@ pub const fn msf_to_lba(msf: Msf) -> i32 {
 }
 
 /// Convert a Logical Block Address (`lba >= -150`) to an [`Msf`] address.
+///
+/// # Errors
+///
+/// Returns [`Error::Overflow`] if `lba < -150` or if the resulting minute
+/// count exceeds `99` (`lba > 449_849`).
 pub const fn lba_to_msf(lba: i32) -> Result<Msf> {
     let total = match lba.checked_add(150) {
         Some(v) if v >= 0 => v,
@@ -352,6 +376,10 @@ pub const fn lba_to_msf(lba: i32) -> Result<Msf> {
 }
 
 /// Decode a single packed-BCD byte (`0x00..=0x99`) to a binary `u8`.
+///
+/// # Errors
+///
+/// Returns [`Error::Overflow`] if either nibble is greater than `9`.
 pub const fn bcd_to_u8(bcd: u8) -> Result<u8> {
     let hi = bcd >> 4;
     let lo = bcd & 0x0F;
@@ -362,6 +390,10 @@ pub const fn bcd_to_u8(bcd: u8) -> Result<u8> {
 }
 
 /// Encode a binary `u8` (`0..=99`) to a packed-BCD byte.
+///
+/// # Errors
+///
+/// Returns [`Error::Overflow`] if `value > 99`.
 pub const fn u8_to_bcd(value: u8) -> Result<u8> {
     if value > 99 {
         return Err(Error::Overflow);
@@ -440,8 +472,10 @@ pub fn regenerate_mode2_form1_edc_ecc(raw: &mut [u8; RAW_SECTOR_SIZE]) {
 
 /// Verify Mode 2 Form 1 EDC and Reed-Solomon P/Q ECC on a raw 2352-byte sector.
 ///
-/// Returns `Ok(())` if EDC, P-parity, and Q-parity all match; otherwise returns
-/// [`Error::BadEdc`] or [`Error::BadEcc`].
+/// # Errors
+///
+/// Returns [`Error::BadEdc`] if the stored 4-byte CRC-32 EDC does not match,
+/// or [`Error::BadEcc`] if either P-parity or Q-parity does not match.
 pub fn verify_mode2_form1_edc_ecc(raw: &[u8; RAW_SECTOR_SIZE]) -> Result<()> {
     let expected = compute_edc(&raw[0x10..MODE2_FORM1_EDC_OFFSET]);
     let actual = u32::from_le_bytes([
@@ -495,6 +529,12 @@ pub fn regenerate_mode1_edc_ecc(raw: &mut [u8; RAW_SECTOR_SIZE]) {
 }
 
 /// Verify Mode 1 EDC, zeroed intermediate field, and Reed-Solomon P/Q ECC.
+///
+/// # Errors
+///
+/// Returns [`Error::BadEdc`] if the stored 4-byte CRC-32 EDC does not match,
+/// or [`Error::BadEcc`] if the 8-byte intermediate zero field is non-zero or
+/// either P-parity or Q-parity does not match.
 pub fn verify_mode1_edc_ecc(raw: &[u8; RAW_SECTOR_SIZE]) -> Result<()> {
     let expected = compute_edc(&raw[..MODE1_EDC_OFFSET]);
     let actual = u32::from_le_bytes([
@@ -553,6 +593,11 @@ pub fn regenerate_mode2_form2_edc(raw: &mut [u8; RAW_SECTOR_SIZE]) {
 /// Note that the CD-ROM XA specification allows Form 2 EDC to be zeroed (omitted);
 /// this function strictly checks the computed CRC-32 against the stored 4 bytes.
 /// Use [`verify_mode2_form2_edc_allow_zero`] to accept zeroed Form 2 EDC fields.
+///
+/// # Errors
+///
+/// Returns [`Error::BadEdc`] if the stored 4-byte EDC does not match the
+/// freshly computed CRC-32 over bytes `16..2348`.
 pub fn verify_mode2_form2_edc(raw: &[u8; RAW_SECTOR_SIZE]) -> Result<()> {
     let expected = compute_edc(&raw[0x10..MODE2_FORM2_EDC_OFFSET]);
     let actual = u32::from_le_bytes([
@@ -569,6 +614,36 @@ pub fn verify_mode2_form2_edc(raw: &[u8; RAW_SECTOR_SIZE]) -> Result<()> {
 
 /// Verify Mode 2 Form 2 EDC on a raw 2352-byte sector, accepting an all-zero
 /// EDC field (`0x0000_0000`) as permitted by the CD-ROM XA specification.
+///
+/// # Example
+///
+/// ```
+/// use cdrom_xa::sector::{
+///     regenerate_mode2_form2_edc, verify_mode2_form2_edc,
+///     verify_mode2_form2_edc_allow_zero, Subheader, RAW_SECTOR_SIZE,
+///     SUBMODE_AUDIO, SUBMODE_FORM2, SYNC_PATTERN,
+/// };
+///
+/// let mut raw = [0u8; RAW_SECTOR_SIZE];
+/// raw[..12].copy_from_slice(&SYNC_PATTERN);
+/// raw[15] = 2;
+/// let sub = Subheader::new(1, 0, SUBMODE_AUDIO | SUBMODE_FORM2, 0x01);
+/// raw[16..24].copy_from_slice(&sub.to_bytes());
+///
+/// // An all-zero Form 2 EDC is accepted by verify_mode2_form2_edc_allow_zero:
+/// verify_mode2_form2_edc_allow_zero(&raw)?;
+///
+/// // Once populated, strict verification passes as well:
+/// regenerate_mode2_form2_edc(&mut raw);
+/// verify_mode2_form2_edc(&raw)?;
+/// verify_mode2_form2_edc_allow_zero(&raw)?;
+/// # Ok::<(), cdrom_xa::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns [`Error::BadEdc`] if the stored 4-byte EDC is non-zero and does not
+/// match the freshly computed CRC-32 over bytes `16..2348`.
 pub fn verify_mode2_form2_edc_allow_zero(raw: &[u8; RAW_SECTOR_SIZE]) -> Result<()> {
     let actual = u32::from_le_bytes([
         raw[MODE2_FORM2_EDC_OFFSET],
@@ -587,6 +662,11 @@ pub fn verify_mode2_form2_edc_allow_zero(raw: &[u8; RAW_SECTOR_SIZE]) -> Result<
 }
 
 /// Build a complete raw 2352-byte Mode 1 sector for `lba` with freshly computed EDC/ECC.
+///
+/// # Errors
+///
+/// Returns [`Error::Overflow`] if `lba` cannot be represented as a standard
+/// packed-BCD MSF address (`lba > 449_849`).
 pub fn build_mode1_sector(
     lba: u32,
     user_data: &[u8; COOKED_SECTOR_SIZE],
@@ -606,6 +686,11 @@ pub fn build_mode1_sector(
 /// Build a complete raw 2352-byte Mode 2 Form 1 sector for `lba` with freshly computed EDC/ECC.
 ///
 /// The Form 2 bit in `subheader.submode` is cleared automatically to guarantee a valid Form 1 sector.
+///
+/// # Errors
+///
+/// Returns [`Error::Overflow`] if `lba` cannot be represented as a standard
+/// packed-BCD MSF address (`lba > 449_849`).
 pub fn build_mode2_form1_sector(
     lba: u32,
     user_data: &[u8; COOKED_SECTOR_SIZE],
@@ -650,6 +735,12 @@ pub fn build_mode2_2336_sector(
 /// - For `Cooked2048` and `Mode1_2352`, returns 2048 bytes.
 /// - For `Mode2_2352` and `Mode2_2336`, inspects the XA subheader and returns
 ///   2048 bytes for Form 1 or 2324 bytes for Form 2.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidSectorSize`] if `sector.len() != mode.stride()`, or
+/// [`Error::BadSync`] for raw 2352-byte modes if the 12-byte sync pattern or
+/// mode byte (`1` or `2`) is invalid.
 pub fn extract_user_data(sector: &[u8], mode: SectorMode) -> Result<&[u8]> {
     if sector.len() != mode.stride() {
         return Err(Error::InvalidSectorSize(sector.len()));
@@ -687,8 +778,12 @@ pub fn extract_user_data(sector: &[u8], mode: SectorMode) -> Result<&[u8]> {
 }
 
 /// Auto-detect the [`SectorMode`] of a disc image slice by inspecting the
-/// ISO-9660 Primary Volume Descriptor signature (`\x01CD001`) at LBA 16,
-/// falling back to raw sync/mode inspection when fewer than 17 sectors are present.
+/// ISO-9660 Primary Volume Descriptor signature (`\x01CD001`) at LBA 16.
+///
+/// If no PVD signature is found (for example, when fewer than 17 sectors are
+/// present or LBA 16 is not an ISO-9660 PVD), falls back to inspecting the
+/// leading raw 2352-byte sync pattern and mode byte when `data.len()` is a
+/// non-zero multiple of `2352`.
 #[must_use]
 pub fn detect_sector_mode(data: &[u8]) -> Option<SectorMode> {
     const PVD_MAGIC: &[u8; 6] = b"\x01CD001";

@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.70"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/JidouGhost-TL/cdrom-xa-rs"
+documentation = "https://docs.rs/cdrom-xa"
 readme = "README.md"
 description = "Pure-Rust, zero-dependency CD-ROM / CD-ROM XA (Yellow Book, CUE/BIN, ISO-9660, EDC/ECC, XA-ADPCM, ISO repacker) library"
 keywords = ["cdrom", "iso9660", "cd-xa", "cue", "adpcm"]

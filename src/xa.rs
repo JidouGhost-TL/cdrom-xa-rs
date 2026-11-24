@@ -4,7 +4,7 @@
 //! Core sound-group decoding ([`XaCoding`], [`XaState`],
 //! [`decode_sound_group_4bit`], [`decode_sound_group_8bit`]) and
 //! [`unwrap_riff_cdxa`] are `no_std` and allocation-free. Higher-level
-//! [`XaDecoder`] and [`XaStream`] are available under the `alloc` feature.
+//! `XaDecoder` and `XaStream` are available under the `alloc` feature.
 
 #[cfg(feature = "alloc")]
 use alloc::collections::BTreeMap;
@@ -147,6 +147,26 @@ const fn decode_4bit_shift(hdr: u8) -> u8 {
 /// For stereo streams, the 224 samples are interleaved `[L, R, L, R, ...]`
 /// (112 frames). For mono streams, all 224 samples belong to the single mono
 /// channel.
+///
+/// # Example
+///
+/// ```
+/// use cdrom_xa::xa::{decode_sound_group_4bit, XaCoding, XaState, SOUND_GROUP_SIZE};
+///
+/// let coding = XaCoding::from_byte(0x00); // 37800 Hz, mono, 4-bit
+/// assert_eq!(coding.sample_rate_hz, 37_800);
+/// assert_eq!(coding.channels(), 1);
+///
+/// let mut group = [0u8; SOUND_GROUP_SIZE];
+/// group[4] = 0x10; // filter 1 (K0 = 60), shift 0
+/// group[16] = 0x01; // first sample delta = +1 << 12 = 4096
+///
+/// let mut state = XaState::new();
+/// let mut pcm = [0i16; 224];
+/// decode_sound_group_4bit(&group, coding.stereo, &mut state, &mut pcm);
+/// assert_eq!(pcm[0], 4096);
+/// assert_eq!(pcm[1], 3840);
+/// ```
 pub fn decode_sound_group_4bit(
     group: &[u8; SOUND_GROUP_SIZE],
     stereo: bool,
@@ -251,6 +271,12 @@ pub fn decode_sound_group_8bit(
 
 /// Validate a 44-byte `RIFF`/`CDXA` wrapper header and return its underlying
 /// raw Mode 2/2352 sector payload slice.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidRiffCdxa`] if the header magic, chunk sizes, or
+/// leading Mode 2/2352 sync/mode bytes are invalid, or [`Error::Overflow`] if
+/// chunk length arithmetic overflows.
 pub fn unwrap_riff_cdxa(bytes: &[u8]) -> Result<&[u8]> {
     if bytes.len() < RIFF_CDXA_HEADER_SIZE {
         return Err(Error::InvalidRiffCdxa("input shorter than 44-byte header"));
@@ -303,6 +329,20 @@ pub fn unwrap_riff_cdxa(bytes: &[u8]) -> Result<&[u8]> {
 }
 
 /// Stateful streaming CD-ROM XA ADPCM decoder (`alloc` feature).
+///
+/// # Example
+///
+/// ```
+/// use cdrom_xa::xa::{XaCoding, XaDecoder, SOUND_DATA_SIZE};
+///
+/// let coding = XaCoding::from_byte(0x01); // 37800 Hz, stereo, 4-bit
+/// let mut decoder = XaDecoder::new(coding);
+/// let silence_payload = [0u8; SOUND_DATA_SIZE];
+/// decoder.push_sector(&silence_payload)?;
+/// let pcm = decoder.finish();
+/// assert_eq!(pcm.len(), 18 * 224);
+/// # Ok::<(), cdrom_xa::Error>(())
+/// ```
 #[cfg(feature = "alloc")]
 #[derive(Debug, Clone)]
 pub struct XaDecoder {
@@ -332,6 +372,10 @@ impl XaDecoder {
     /// Decode one Form 2 audio sector payload (at least `2304` bytes, typically
     /// `2324` bytes) and return its PCM samples while advancing internal
     /// predictor state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedEof`] if `payload.len() < SOUND_DATA_SIZE`.
     pub fn decode_sector(&mut self, payload: &[u8]) -> Result<Vec<i16>> {
         if payload.len() < SOUND_DATA_SIZE {
             return Err(Error::UnexpectedEof);
@@ -361,6 +405,10 @@ impl XaDecoder {
 
     /// Decode one Form 2 audio sector payload and append its PCM samples to the
     /// internal buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedEof`] if `payload.len() < SOUND_DATA_SIZE`.
     pub fn push_sector(&mut self, payload: &[u8]) -> Result<()> {
         let mut sector_pcm = self.decode_sector(payload)?;
         self.samples.append(&mut sector_pcm);
@@ -406,6 +454,29 @@ struct IndexedChannel {
 ///
 /// Accepts raw Mode 2/2352 streams, stripped Mode 2/2336 streams, or
 /// `RIFF`/`CDXA`-wrapped Mode 2/2352 containers.
+///
+/// # Example
+///
+/// ```
+/// use cdrom_xa::sector::{
+///     Subheader, RAW_SECTOR_SIZE, SUBMODE_AUDIO, SUBMODE_FORM2, SUBMODE_REALTIME, SYNC_PATTERN,
+/// };
+/// use cdrom_xa::xa::XaStream;
+///
+/// let mut raw = vec![0u8; RAW_SECTOR_SIZE];
+/// raw[..12].copy_from_slice(&SYNC_PATTERN);
+/// raw[15] = 2;
+/// let sub = Subheader::new(1, 0, SUBMODE_AUDIO | SUBMODE_FORM2 | SUBMODE_REALTIME, 0x01);
+/// raw[16..24].copy_from_slice(&sub.to_bytes());
+///
+/// let stream = XaStream::from_vec(raw)?;
+/// let infos = stream.streams();
+/// assert_eq!(infos.len(), 1);
+/// let (coding, pcm) = stream.decode(1, 0)?;
+/// assert_eq!(coding.sample_rate_hz, 37_800);
+/// assert_eq!(pcm.len(), 18 * 224);
+/// # Ok::<(), cdrom_xa::Error>(())
+/// ```
 #[cfg(feature = "alloc")]
 pub struct XaStream {
     data: Vec<u8>,
@@ -490,6 +561,15 @@ fn index_xa_payload(
 #[cfg(feature = "alloc")]
 impl XaStream {
     /// Parse and index all Mode 2 Form 2 audio streams in `bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRiffCdxa`] if a `RIFF`-prefixed header is
+    /// malformed, [`Error::InvalidSectorSize`] if the payload length is not a
+    /// multiple of 2352 or 2336, [`Error::BadSync`] if a raw Mode 2/2352 sector
+    /// has an invalid sync or mode byte, [`Error::InvalidXa`] if the stream is
+    /// empty, has a mismatched duplicated subheader, or contains no Mode 2
+    /// Form 2 audio sectors, or [`Error::Overflow`] on container length overflow.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let payload = if bytes.starts_with(b"RIFF") {
             unwrap_riff_cdxa(bytes)?
@@ -507,6 +587,10 @@ impl XaStream {
 
     /// Parse and index all Mode 2 Form 2 audio streams from an owned `Vec<u8>`
     /// without cloning the underlying buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`XaStream::parse`].
     pub fn from_vec(data: Vec<u8>) -> Result<Self> {
         let (payload_start, payload_len) = if data.starts_with(b"RIFF") {
             let payload = unwrap_riff_cdxa(&data)?;
@@ -552,6 +636,11 @@ impl XaStream {
     }
 
     /// Decode the selected `(file, channel)` stream to `(XaCoding, Vec<i16>)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidXa`] if `(file, channel)` was not indexed in
+    /// this stream, or [`Error::UnexpectedEof`] if a sector payload is truncated.
     pub fn decode(&self, file: u8, channel: u8) -> Result<(XaCoding, Vec<i16>)> {
         let key = XaStreamKey { file, channel };
         let indexed = self

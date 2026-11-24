@@ -1,12 +1,26 @@
 //! Non-destructive ISO-9660 / CD-ROM XA disc image repacker.
 //!
-//! Unmodified sectors are copied byte-for-byte, preserving all Mode 2 Form 2
-//! audio/video sectors, system areas, and padding. Files whose replacement fits
-//! within their existing sector span are overwritten in place (updating their
+//! Supports all four [`SectorMode`] layouts
+//! (`Mode1_2352`, `Mode2_2352`, `Mode2_2336`, and `Cooked2048`). Unmodified
+//! sectors are copied byte-for-byte, preserving all Mode 2 Form 2 audio/video
+//! sectors, system areas, and padding. Files whose replacement fits within
+//! their existing sector span are overwritten in place (updating their
 //! directory record's both-endian `data_len`); larger replacements are appended
 //! sector-aligned at the end of the track (updating both the directory record's
 //! `extent_lba`/`data_len` and the PVD `volume_space_size`). Every modified and
 //! appended sector has its physical EDC/ECC regenerated.
+//!
+//! # Invariants & Limitations
+//!
+//! - **ISO-9660 Path Table invariant:** [`IsoRepacker`] only replaces existing
+//!   files and never adds, removes, or moves directories, so the existing
+//!   L-type and M-type Path Tables remain valid without modification.
+//! - **Multi-track single-BIN `.cue` images:** When the underlying [`IsoImage`]
+//!   has trailing tracks in the same `.bin` file
+//!   ([`IsoImage::has_trailing_tracks`] is `true`), **in-place** replacements
+//!   that fit within the file's existing sector span are supported, but
+//!   replacements that require relocating/appending sectors are rejected with
+//!   [`Error::InvalidIso`] to avoid overwriting subsequent tracks.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
@@ -98,6 +112,24 @@ impl IsoRepacker {
     }
 
     /// Open a `.cue`, `.bin`, or `.iso` image file for repacking (`std` feature).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cdrom_xa::repack::IsoRepacker;
+    ///
+    /// let mut repacker = IsoRepacker::open("disc.cue")?;
+    /// repacker.replace("/DATA/SCRIPT.BIN", vec![0x55u8; 4096]);
+    ///
+    /// let mut out = std::fs::File::create("patched.bin")?;
+    /// let report = repacker.write_to(&mut out)?;
+    /// println!("Replaced {} files", report.replaced_files);
+    /// # Ok::<(), cdrom_xa::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`IsoImage::open`].
     #[cfg(feature = "std")]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self::new(IsoImage::open(path)?))
@@ -119,6 +151,20 @@ impl IsoRepacker {
     }
 
     /// Repack the disc image into an in-memory `Vec<u8>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::FileNotFound`] if any queued replacement path does not
+    /// exist, [`Error::InvalidIso`] if a target path is a directory, if a
+    /// replacement attempts to overwrite a Mode 2 Form 2 sector in place, if a
+    /// replacement requires relocation on a multi-track single-BIN image
+    /// ([`IsoImage::has_trailing_tracks`]), or if directory metadata is
+    /// malformed/cyclic; [`Error::InvalidSectorSize`] if the image length is
+    /// not an exact multiple of the sector stride; [`Error::BadSync`] on an
+    /// invalid raw sector header; [`Error::UnexpectedEof`] on truncated input;
+    /// [`Error::Overflow`] if the final image would exceed the standard
+    /// packed-BCD MSF limit (`99:59:74`) or size limits; or `Error::Io` on
+    /// `std` reader I/O failure.
     pub fn to_vec(&self) -> Result<(Vec<u8>, RepackReport)> {
         let plan = self.plan()?;
         let total_bytes = usize::try_from(plan.report.image_bytes).map_err(|_| Error::Overflow)?;
@@ -131,6 +177,14 @@ impl IsoRepacker {
     }
 
     /// Stream the complete repacked disc image to `output` (`std` feature).
+    ///
+    /// Planning and validation complete before any bytes are written to `output`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if writing to `output` or reading from the source
+    /// image fails, or any planning/validation error documented on
+    /// [`IsoRepacker::to_vec`].
     #[cfg(feature = "std")]
     pub fn write_to(&self, output: &mut impl Write) -> Result<RepackReport> {
         let plan = self.plan()?;

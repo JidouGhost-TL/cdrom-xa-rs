@@ -122,6 +122,13 @@ pub struct PrimaryVolumeDescriptor {
 
 impl PrimaryVolumeDescriptor {
     /// Parse a Primary Volume Descriptor from a 2048-byte cooked block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedEof`] if `block.len() < COOKED_SECTOR_SIZE`,
+    /// [`Error::InvalidIso`] if the PVD magic, version, logical block size,
+    /// both-endian fields, or root directory record are invalid, or
+    /// [`Error::Overflow`] on directory record length overflow.
     pub fn parse(block: &[u8]) -> Result<Self> {
         if block.len() < COOKED_SECTOR_SIZE {
             return Err(Error::UnexpectedEof);
@@ -234,11 +241,22 @@ impl fmt::Debug for IsoImage {
 
 impl IsoImage {
     /// Mount an ISO-9660 image from a byte slice, auto-detecting the [`SectorMode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidIso`] if the sector layout cannot be detected or
+    /// the Primary Volume Descriptor at LBA 16 is invalid, [`Error::UnexpectedEof`]
+    /// if the image is truncated before LBA 16, [`Error::BadSync`] if a raw sector
+    /// header is invalid, or [`Error::Overflow`] if the sector count overflows `u32`.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         Self::from_vec(data.to_vec())
     }
 
     /// Mount an ISO-9660 image from an owned `Vec<u8>`, auto-detecting the [`SectorMode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`IsoImage::from_bytes`].
     pub fn from_vec(data: Vec<u8>) -> Result<Self> {
         let mode = detect_sector_mode(&data)
             .ok_or(Error::InvalidIso("unable to detect CD-ROM sector layout"))?;
@@ -246,11 +264,22 @@ impl IsoImage {
     }
 
     /// Mount an ISO-9660 image from a byte slice using an explicit [`SectorMode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedEof`] if the image is truncated before LBA 16,
+    /// [`Error::BadSync`] if the raw sector at LBA 16 has an invalid sync/mode
+    /// header, [`Error::InvalidIso`] if the Primary Volume Descriptor is invalid,
+    /// or [`Error::Overflow`] if the sector count overflows `u32`.
     pub fn from_bytes_with_mode(data: &[u8], mode: SectorMode) -> Result<Self> {
         Self::from_vec_with_mode(data.to_vec(), mode)
     }
 
     /// Mount an ISO-9660 image from an owned `Vec<u8>` using an explicit [`SectorMode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`IsoImage::from_bytes_with_mode`].
     pub fn from_vec_with_mode(data: Vec<u8>, mode: SectorMode) -> Result<Self> {
         let stride = mode.stride();
         let sectors_usize = data.len() / stride;
@@ -260,6 +289,14 @@ impl IsoImage {
     }
 
     /// Mount an ISO-9660 image from any `Read + Seek` stream, auto-detecting the [`SectorMode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] on stream I/O failure, [`Error::InvalidIso`] if the
+    /// sector layout cannot be detected or the Primary Volume Descriptor is
+    /// invalid, [`Error::UnexpectedEof`] if the stream ends before LBA 16,
+    /// [`Error::BadSync`] if a raw sector header is invalid, or
+    /// [`Error::Overflow`] if the sector count overflows `u32`.
     #[cfg(feature = "std")]
     pub fn from_reader<R: Read + Seek + Send + 'static>(mut reader: R) -> Result<Self> {
         let byte_len = reader.seek(SeekFrom::End(0))?;
@@ -269,6 +306,13 @@ impl IsoImage {
     }
 
     /// Mount an ISO-9660 image from any `Read + Seek` stream with an explicit [`SectorMode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] on stream I/O failure, [`Error::UnexpectedEof`] if
+    /// the stream ends before LBA 16, [`Error::BadSync`] if a raw sector header
+    /// is invalid, [`Error::InvalidIso`] if the Primary Volume Descriptor is
+    /// invalid, or [`Error::Overflow`] if the sector count overflows `u32`.
     #[cfg(feature = "std")]
     pub fn from_reader_with_mode<R: Read + Seek + Send + 'static>(
         mut reader: R,
@@ -304,6 +348,32 @@ impl IsoImage {
     /// slice is clamped to the next track's `INDEX 00`/`01` byte offset and
     /// [`IsoImage::has_trailing_tracks`] returns `true`. Otherwise opens the
     /// image directly and auto-detects its layout.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cdrom_xa::iso::IsoImage;
+    ///
+    /// let image = IsoImage::open("disc.cue")?;
+    /// if let Some(entry) = image.find("/README.TXT")? {
+    ///     let cooked = image.read_file(&entry)?;
+    ///     println!("README.TXT: {} bytes", cooked.len());
+    /// }
+    /// if let Some(xa) = image.find("/SOUND/BGM.XA")? {
+    ///     let raw_sectors = image.read_file_raw_sectors(&xa)?;
+    ///     println!("BGM.XA: {} raw bytes", raw_sectors.len());
+    /// }
+    /// # Ok::<(), cdrom_xa::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if opening or reading the `.cue` or image file
+    /// fails, [`Error::InvalidCue`] if a `.cue` sheet is malformed or contains
+    /// no data track, [`Error::InvalidIso`] if the sector layout or Primary
+    /// Volume Descriptor is invalid, [`Error::UnexpectedEof`] if the file or
+    /// track slice is truncated, [`Error::BadSync`] if a raw sector header is
+    /// invalid, or [`Error::Overflow`] on track offset or sector count overflow.
     #[cfg(feature = "std")]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -436,6 +506,12 @@ impl IsoImage {
     }
 
     /// Read one complete stored sector at `lba` in its native [`SectorMode`] stride.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedEof`] if `lba >= self.sector_count()`,
+    /// [`Error::Overflow`] on offset arithmetic overflow, or `Error::Io` when
+    /// backed by a `std` reader and an I/O error occurs.
     pub fn read_sector_raw(&self, lba: u32) -> Result<Vec<u8>> {
         read_raw_from_source(&self.source, self.mode, self.sector_count, lba)
     }
@@ -443,6 +519,13 @@ impl IsoImage {
     /// Read one complete stored sector at `lba` directly into `buf`.
     ///
     /// `buf.len()` must equal `self.mode().stride()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidSectorSize`] if `buf.len() != self.mode().stride()`,
+    /// [`Error::UnexpectedEof`] if `lba >= self.sector_count()`,
+    /// [`Error::Overflow`] on offset arithmetic overflow, or `Error::Io` when
+    /// backed by a `std` reader and an I/O error occurs.
     pub fn read_sector_raw_into(&self, lba: u32, buf: &mut [u8]) -> Result<()> {
         if buf.len() != self.mode.stride() {
             return Err(Error::InvalidSectorSize(buf.len()));
@@ -471,6 +554,14 @@ impl IsoImage {
     /// Returns [`Error::InvalidIso`] if the sector is a Mode 2 Form 2 sector
     /// (2324-byte payload); use [`IsoImage::read_sector_raw`] or
     /// [`IsoImage::read_file_raw_sectors`] for Form 2 sectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedEof`] if `lba >= self.sector_count()`,
+    /// [`Error::BadSync`] if a raw sector has an invalid sync/mode header,
+    /// [`Error::InvalidIso`] if the sector is Mode 2 Form 2,
+    /// [`Error::Overflow`] on offset arithmetic overflow, or `Error::Io` on
+    /// `std` reader I/O failure.
     pub fn read_sector_cooked(&self, lba: u32) -> Result<[u8; COOKED_SECTOR_SIZE]> {
         let raw = self.read_sector_raw(lba)?;
         let user = extract_user_data(&raw, self.mode)?;
@@ -486,6 +577,14 @@ impl IsoImage {
 
     /// Walk the entire ISO-9660 directory tree depth-first and return every file
     /// and directory record (excluding `.` and `..`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidIso`] if a directory record is malformed, cyclic,
+    /// or exceeds the maximum nesting depth, [`Error::UnexpectedEof`] if a
+    /// directory extent extends past EOF, [`Error::BadSync`] on an invalid raw
+    /// sector header, [`Error::Overflow`] on extent arithmetic overflow, or
+    /// `Error::Io` on `std` reader I/O failure.
     pub fn records(&self) -> Result<Vec<IsoRecord>> {
         let mut out = Vec::new();
         let mut visited = BTreeSet::new();
@@ -503,6 +602,20 @@ impl IsoImage {
 
     /// Resolve a slash-separated path (e.g. `"/DATA/ASSET.BIN"` or `"README.TXT"`)
     /// case-insensitively to its [`IsoRecord`].
+    ///
+    /// Both `/` and `\` are accepted as path separators. Passing `""` or `"/"`
+    /// returns the root directory record (`path: "/"`). Within each directory,
+    /// matching prefers an exact case-insensitive match against the raw ISO-9660
+    /// identifier (including any `;version` suffix, e.g. `"ASSET.BIN;1"`) before
+    /// falling back to the version-stripped name (e.g. `"ASSET.BIN"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidIso`] if a traversed directory is malformed or
+    /// contains a cyclic reference, [`Error::UnexpectedEof`] if a directory
+    /// extent extends past EOF, [`Error::BadSync`] on an invalid raw sector
+    /// header, [`Error::Overflow`] on extent arithmetic overflow, or `Error::Io`
+    /// on `std` reader I/O failure.
     pub fn find(&self, path: &str) -> Result<Option<IsoRecord>> {
         let components: Vec<&str> = path.split(['/', '\\']).filter(|c| !c.is_empty()).collect();
         if components.is_empty() {
@@ -569,6 +682,19 @@ impl IsoImage {
     }
 
     /// Read a file's logical cooked contents (2048 bytes/sector, truncated to `record.size`).
+    ///
+    /// This method is for Mode 1 and Mode 2 Form 1 data files. Mode 2 Form 2
+    /// files (such as CD-ROM XA audio/video with 2324-byte payloads) cannot be
+    /// read as cooked 2048-byte blocks and will fail with [`Error::InvalidIso`];
+    /// use [`IsoImage::read_file_raw_sectors`] for those files instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidIso`] if `record.is_dir` is `true` or if any
+    /// sector in the file extent is Mode 2 Form 2, [`Error::UnexpectedEof`] if
+    /// the file extent extends past EOF, [`Error::BadSync`] on an invalid raw
+    /// sector header, [`Error::Overflow`] on extent arithmetic overflow, or
+    /// `Error::Io` on `std` reader I/O failure.
     pub fn read_file(&self, record: &IsoRecord) -> Result<Vec<u8>> {
         if record.is_dir {
             return Err(Error::InvalidIso("cannot read_file on a directory record"));
@@ -588,6 +714,13 @@ impl IsoImage {
 
     /// Read all raw stored sectors spanned by `record` (preserving full 2352-byte
     /// or 2336-byte framing, subheaders, and Form 2 payloads).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidIso`] if `record.is_dir` is `true`,
+    /// [`Error::UnexpectedEof`] if the file extent extends past EOF,
+    /// [`Error::Overflow`] on extent or byte-length arithmetic overflow, or
+    /// `Error::Io` on `std` reader I/O failure.
     pub fn read_file_raw_sectors(&self, record: &IsoRecord) -> Result<Vec<u8>> {
         if record.is_dir {
             return Err(Error::InvalidIso(

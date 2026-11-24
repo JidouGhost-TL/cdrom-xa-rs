@@ -3,12 +3,41 @@
 //! Provides Yellow Book physical sector framing, EDC/ECC generation and
 //! verification, CUE sheet parsing, ISO-9660 filesystem traversal with
 //! CD-ROM XA System Use attributes, XA-ADPCM audio decoding, and
-//! non-destructive Mode 2/2352 disc repacking.
+//! non-destructive ISO-9660 / CD-ROM XA disc repacking (supporting
+//! `Mode1_2352`, `Mode2_2352`, `Mode2_2336`, and `Cooked2048` layouts).
+//!
+//! # Quick Example
+//!
+//! Building, verifying, and regenerating a raw Mode 2 Form 1 sector works in
+//! bare `no_std` mode with zero allocations:
+//!
+//! ```
+//! use cdrom_xa::sector::{
+//!     build_mode2_form1_sector, regenerate_mode2_form1_edc_ecc, verify_mode2_form1_edc_ecc,
+//!     Subheader, COOKED_SECTOR_SIZE, SUBMODE_DATA, SUBMODE_EOF, SUBMODE_EOR,
+//! };
+//!
+//! let user_data = [0x42u8; COOKED_SECTOR_SIZE];
+//! let subheader = Subheader::new(0, 0, SUBMODE_DATA | SUBMODE_EOR | SUBMODE_EOF, 0);
+//!
+//! let mut raw = build_mode2_form1_sector(16, &user_data, subheader)?;
+//! verify_mode2_form1_edc_ecc(&raw)?;
+//!
+//! // Corrupt user data, observe verification failure, then regenerate EDC/ECC:
+//! raw[24] ^= 0xFF;
+//! assert!(verify_mode2_form1_edc_ecc(&raw).is_err());
+//! regenerate_mode2_form1_edc_ecc(&mut raw);
+//! verify_mode2_form1_edc_ecc(&raw)?;
+//! # Ok::<(), cdrom_xa::Error>(())
+//! ```
 //!
 //! # Feature Flags
 //!
-//! - `std` *(enabled by default)* — enables `std::io` / filesystem helpers and
-//!   `std::error::Error`. Implies `alloc`.
+//! - `std` *(enabled by default)* — enables `std::io` / filesystem helpers
+//!   (`iso::IsoImage::open`, `iso::IsoImage::from_reader`,
+//!   `iso::IsoImage::from_reader_with_mode`, `repack::IsoRepacker::open`,
+//!   `repack::IsoRepacker::write_to`), `Error::Io`, and `std::error::Error`.
+//!   Implies `alloc`.
 //! - `alloc` — enables heap-backed parsers (`cue`, `iso`, `repack`,
 //!   `xa::XaDecoder`, `xa::XaStream`) in `no_std` environments.
 //! - With `--no-default-features`, the crate builds in bare `no_std` mode with

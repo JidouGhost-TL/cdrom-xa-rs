@@ -3,6 +3,29 @@
 //! Parses standard `FILE`, `TRACK`, `INDEX`, `PREGAP`, and `POSTGAP`
 //! directives while ignoring metadata directives (`REM`, `CATALOG`, `ISRC`,
 //! `TITLE`, `PERFORMER`, `FLAGS`, etc.).
+//!
+//! # Example
+//!
+//! ```
+//! use cdrom_xa::cue::{CueSheet, TrackMode};
+//! use cdrom_xa::sector::SectorMode;
+//!
+//! let text = "\
+//! FILE \"disc.bin\" BINARY
+//!   TRACK 01 MODE2/2352
+//!     INDEX 01 00:00:00
+//!   TRACK 02 AUDIO
+//!     INDEX 00 10:00:00
+//!     INDEX 01 10:02:00
+//! ";
+//!
+//! let sheet = CueSheet::parse(text)?;
+//! let (file, track) = sheet.first_data_track().expect("data track present");
+//! assert_eq!(file.filename, "disc.bin");
+//! assert_eq!(track.mode, TrackMode::Mode2_2352);
+//! assert_eq!(track.mode.sector_mode(), Some(SectorMode::Mode2_2352));
+//! # Ok::<(), cdrom_xa::Error>(())
+//! ```
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -18,7 +41,7 @@ pub const MAX_CUE_TRACKS: usize = 99;
 pub enum TrackMode {
     /// Red Book CD-DA audio track (2352 bytes/sector).
     Audio,
-    /// Cooked Mode 1 data track (2048 bytes/sector).
+    /// Cooked 2048-byte data track (`MODE1/2048` or `MODE2/2048` in CUE sheets).
     Mode1_2048,
     /// Raw Mode 1 data track (2352 bytes/sector).
     Mode1_2352,
@@ -109,6 +132,14 @@ pub struct CueSheet {
 
 impl CueSheet {
     /// Parse a CUE sheet from UTF-8 text (stripping a leading UTF-8 BOM if present).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCue`] if any `FILE`, `TRACK`, `INDEX`, `PREGAP`,
+    /// or `POSTGAP` directive is malformed, appears out of order, uses an
+    /// unsupported track mode, contains an out-of-range track/index/MSF value,
+    /// has non-increasing track numbers or timestamps, or exceeds
+    /// [`MAX_CUE_TRACKS`].
     pub fn parse(text: &str) -> Result<Self> {
         let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
         let mut files: Vec<CueFile> = Vec::new();
