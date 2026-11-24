@@ -1,0 +1,20 @@
+[package]
+name = "cdrom-xa"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/JidouGhost-TL/cdrom-xa-rs"
+readme = "README.md"
+description = "Pure-Rust, zero-dependency CD-ROM / CD-ROM XA (Yellow Book, CUE/BIN, ISO-9660, EDC/ECC, XA-ADPCM, ISO repacker) library"
+keywords = ["cdrom", "iso9660", "cd-xa", "cue", "adpcm"]
+categories = ["encoding", "multimedia::audio", "no-std", "parser-implementations"]
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+
+[dependencies]
+
+[dev-dependencies]
